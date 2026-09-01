@@ -916,36 +916,12 @@ def main():
             unsafe_allow_html=True,
         )
         st.markdown(
-            "Generate a shareable link or download a static HTML report."
+            "Download a static HTML report."
         )
 
         st.markdown("---")
 
-        st.subheader("1. Shareable Dashboard Link")
-        st.markdown('<div class="share-box">', unsafe_allow_html=True)
-
-        current_view = st.selectbox(
-            "Select view to share",
-            ["Dashboard", "Alerts", "Visit Matrix", "Safety Screening"],
-        )
-        share_url = generate_shareable_link(
-            current_view.lower().replace(" ", "_")
-        )
-
-        st.code(share_url, language="text")
-        st.markdown(
-            """
-            <p><b>How to use:</b> Update <code>base_url</code> in the source code 
-            to your deployed Streamlit Cloud URL. Anyone with this link will open 
-            the dashboard directly to this view.</p>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown("---")
-
-        st.subheader("2. Download Static HTML Report")
+        st.subheader("Download Static HTML Report")
         st.markdown(
             "Generate a self-contained HTML file that can be emailed or shared offline."
         )
@@ -972,11 +948,6 @@ Enrollment:
   - Consented:              {enrollment['consented']} ({enrollment['consented'] / max(enrollment['eligible_referred'], 1) * 100:.0f}%)
   - Clinically Eligible:    {enrollment['clinically_eligible']}
   - Stratified:             {enrollment['stratified']}
-
-Safety Screening:
-  - MINI-S Eligible:        {safety.get('mini_eligible', 0) if safety else 0}
-  - HHDS Eligible:          {safety.get('hhds_eligible', 0) if safety else 0}
-  - AUDIT High (≥16):       {safety.get('audit_high', 0) if safety else 0}
 
 Alerts:
   - Overdue visits:         {len(overdue)}
