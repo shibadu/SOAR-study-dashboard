@@ -2,7 +2,7 @@
 SOAR Study Enrollment & Follow-up Tracker
 =========================================
 A Streamlit dashboard for the SOAR Study REDCap project.
-Displays enrollment metrics, visit adherence, safety screening
+Displays enrollment funnel, visit adherence, safety screening
 (MINI-S / HHDS / AUDIT), upcoming appointments, and generates
 shareable summary reports.
 
@@ -23,6 +23,7 @@ from io import BytesIO
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from redcap import Project
 
 # ───────────────────────────────────────────────────────────────
@@ -439,7 +440,7 @@ def create_summary_html(enrollment, visit_matrix, upcoming, overdue, safety=None
         <h1>SOAR Study Enrollment & Follow-up Summary</h1>
         <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
 
-        <h2>Enrollment Summary</h2>
+        <h2>Enrollment Funnel</h2>
         <div>
             <div class="metric"><div class="metric-value">{enrollment.get("total_screened", 0)}</div><div class="metric-label">Pre-Screened</div></div>
             <div class="metric"><div class="metric-value">{enrollment.get("eligible_referred", 0)}</div><div class="metric-label">Eligible & Referred</div></div>
@@ -479,6 +480,7 @@ def main():
             "Select View",
             [
                 "Dashboard",
+                "Enrollment Funnel",
                 "Visit Matrix",
                 "Safety Screening",
                 "Alerts",
@@ -589,6 +591,41 @@ def main():
 
         st.markdown("---")
 
+        st.subheader("Enrollment Funnel")
+        funnel_data = pd.DataFrame(
+            {
+                "Stage": [
+                    "Pre-Screened",
+                    "Eligible & Referred",
+                    "Consented",
+                    "Clinically Eligible",
+                    "Stratified",
+                ],
+                "Count": [
+                    enrollment["total_screened"],
+                    enrollment["eligible_referred"],
+                    enrollment["consented"],
+                    enrollment["clinically_eligible"],
+                    enrollment["stratified"],
+                ],
+            }
+        )
+        fig_funnel = go.Figure(
+            go.Funnel(
+                y=funnel_data["Stage"],
+                x=funnel_data["Count"],
+                textposition="inside",
+                textinfo="value+percent initial",
+                marker={
+                    "color": ["#1f4e79", "#2e7d32", "#f57c00", "#7b1fa2", "#c62828"]
+                },
+            )
+        )
+        fig_funnel.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=400)
+        st.plotly_chart(fig_funnel, use_container_width=True)
+
+        st.markdown("---")
+
         col_left, col_right = st.columns([1, 1])
 
         with col_left:
@@ -663,6 +700,60 @@ def main():
                 st.dataframe(upcoming, use_container_width=True, hide_index=True)
             else:
                 st.info("No visits scheduled in the next 7 days.")
+
+    # ═══════════════════════════════════════════════════════════
+    # VIEW: ENROLLMENT FUNNEL
+    # ═══════════════════════════════════════════════════════════
+    elif view_mode == "Enrollment Funnel":
+        st.markdown(
+            '<div class="main-header">Enrollment Funnel Details</div>',
+            unsafe_allow_html=True,
+        )
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Not Eligible (Pre-screen)", enrollment["not_eligible"])
+        col2.metric("Eligible but Declined", enrollment["declined"])
+        col3.metric(
+            "Screened Out (Behavioral)",
+            max(0, enrollment["enrolled"] - enrollment["clinically_eligible"]),
+        )
+
+        st.markdown("---")
+
+        if not df_prescreen.empty and "prescreening_outcome" in df_prescreen.columns:
+            st.subheader("Pre-Screening Outcomes")
+            outcome_counts = (
+                df_prescreen["prescreening_outcome"].value_counts().reset_index()
+            )
+            outcome_map = {
+                "1": "Eligible & Referred",
+                "2": "Eligible but Declined",
+                "3": "Not Eligible",
+            }
+            outcome_counts["Outcome"] = outcome_counts["prescreening_outcome"].map(
+                outcome_map
+            )
+            fig = px.pie(
+                outcome_counts,
+                values="count",
+                names="Outcome",
+                color_discrete_sequence=px.colors.sequential.Blues_r,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        if not df_prescreen.empty and "motivation_quit" in df_prescreen.columns:
+            st.subheader("Motivation to Quit Distribution")
+            df_prescreen["motivation_quit_num"] = pd.to_numeric(
+                df_prescreen["motivation_quit"], errors="coerce"
+            )
+            fig = px.histogram(
+                df_prescreen,
+                x="motivation_quit_num",
+                nbins=10,
+                labels={"motivation_quit_num": "Motivation Score (1-10)"},
+            )
+            fig.update_layout(bargap=0.1)
+            st.plotly_chart(fig, use_container_width=True)
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: VISIT MATRIX
