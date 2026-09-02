@@ -69,10 +69,10 @@ STRATA_MAP = {
 }
 
 # Field names confirmed against the SOAR Study data dictionary
-# (SOARStudyScreeningTool_DataDictionary_2026-05-11):
-#   - prescreen_age: calc field on the pre_screening form, "Age (years)"
+# (SOARStudyScreeningTool_DataDictionary_2026-05-11) and the live REDCap export:
+#   - pre_screen_age / prescreen_age: calc field on the pre_screening form, "Age (years)"
 #   - gender: radio field on the pre_screening form, "Gender:" -> 1=Male, 2=Female
-AGE_FIELD_CANDIDATES = ["prescreen_age", "age", "participant_age", "ce_age", "demo_age", "age_years"]
+AGE_FIELD_CANDIDATES = ["pre_screen_age", "prescreen_age", "age", "participant_age", "ce_age", "demo_age", "age_years"]
 SEX_FIELD_CANDIDATES = ["gender", "sex", "participant_sex", "ce_sex", "demo_sex"]
 SEX_MAP = {"1": "Male", "2": "Female"}
 
@@ -427,7 +427,9 @@ def build_stratified_demographics(df_clinical):
     if age_col is not None:
         out["Age"] = pd.to_numeric(stratified[age_col], errors="coerce")
     if sex_col is not None:
-        out["Sex"] = stratified[sex_col].astype(str).map(lambda k: SEX_MAP.get(k, k))
+        out["Sex"] = stratified[sex_col].astype(str).map(
+            lambda k: SEX_MAP.get(k, "Unknown" if k in ("", "nan", "0") else f"Unknown ({k})")
+        )
 
     return out
 
