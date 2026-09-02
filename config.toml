@@ -1,0 +1,5 @@
+# Hides "Fork", "GitHub", "Report a bug", "About", and the deploy button
+# from the app toolbar for viewers. This is the officially supported way
+# to control the toolbar (works alongside the CSS fallback in app.py).
+[client]
+toolbarMode = "minimal"

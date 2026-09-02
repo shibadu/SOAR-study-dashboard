@@ -48,8 +48,33 @@ st.markdown("""
     .alert-missed { background: #f8d7da; padding: 0.5rem 1rem; border-radius: 6px; border-left: 4px solid #dc3545; }
     .share-box { background: #e7f3ff; padding: 1rem; border-radius: 8px; border: 1px solid #b3d9ff; }
     .stDataFrame { font-size: 0.9rem; }
+
+    /* Hide Streamlit Community Cloud's Fork / GitHub / Deploy toolbar for viewers */
+    .stDeployButton { display: none !important; }
+    [data-testid="stToolbarActionButton"] { display: none !important; }
+    [data-testid="stToolbar"] { visibility: hidden !important; height: 0 !important; }
+    #MainMenu { visibility: hidden !important; }
+    [class*="viewerBadge"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
+
+# ───────────────────────────────────────────────────────────────
+# SHARED CONSTANTS
+# ───────────────────────────────────────────────────────────────
+STRATA_MAP = {
+    "1": "Low Smoking + Low Alcohol",
+    "2": "Low Smoking + High Alcohol",
+    "3": "High Smoking + Low Alcohol",
+    "4": "High Smoking + High Alcohol",
+}
+
+# NOTE: verify these two lists (and the SEX_MAP coding below) against your
+# REDCap data dictionary and adjust the field/value names if they differ.
+AGE_FIELD_CANDIDATES = ["age", "participant_age", "ce_age", "demo_age", "age_years"]
+SEX_FIELD_CANDIDATES = ["sex", "gender", "participant_sex", "ce_sex", "demo_sex"]
+SEX_MAP = {"1": "Male", "2": "Female", "3": "Other"}
+
+VISIT_WINDOW_ORDER = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
 
 # ───────────────────────────────────────────────────────────────
 # CONFIG & CONNECTION
@@ -210,11 +235,11 @@ def build_visit_matrix(df_visits):
         aggfunc="first",
     )
 
-    for col in ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]:
+    for col in VISIT_WINDOW_ORDER:
         if col not in matrix.columns:
             matrix[col] = None
 
-    matrix = matrix[["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]]
+    matrix = matrix[VISIT_WINDOW_ORDER]
 
     status_map = {
         "1": "Completed",
@@ -344,13 +369,6 @@ def build_stratification_summary(df_clinical):
     if df_clinical.empty or "ce_assigned_strata" not in df_clinical.columns:
         return pd.DataFrame()
 
-    strata_map = {
-        "1": "Low Smoking + Low Alcohol",
-        "2": "Low Smoking + High Alcohol",
-        "3": "High Smoking + Low Alcohol",
-        "4": "High Smoking + High Alcohol",
-    }
-
     strata = df_clinical[
         df_clinical["ce_assigned_strata"].notna()
         & (df_clinical["ce_assigned_strata"] != "")
@@ -364,12 +382,131 @@ def build_stratification_summary(df_clinical):
 
     summary = pd.DataFrame(
         {
-            "Stratum": [strata_map.get(k, k) for k in counts.index],
+            "Stratum": [STRATA_MAP.get(k, k) for k in counts.index],
             "Count": counts.values,
             "% of Stratified": (counts.values / total * 100).round(1),
         }
     )
     return summary.sort_values("Stratum").reset_index(drop=True)
+
+
+def build_stratified_demographics(df_clinical):
+    """Age & sex breakdown for participants who have an assigned stratum.
+
+    Looks for the field names in AGE_FIELD_CANDIDATES / SEX_FIELD_CANDIDATES
+    (see SHARED CONSTANTS) and uses the first one present in the data.
+    Returns an empty DataFrame if neither field is found.
+    """
+    if df_clinical.empty or "ce_assigned_strata" not in df_clinical.columns:
+        return pd.DataFrame()
+
+    stratified = df_clinical[
+        df_clinical["ce_assigned_strata"].notna()
+        & (df_clinical["ce_assigned_strata"] != "")
+    ].copy()
+
+    if stratified.empty:
+        return pd.DataFrame()
+
+    age_col = next((c for c in AGE_FIELD_CANDIDATES if c in stratified.columns), None)
+    sex_col = next((c for c in SEX_FIELD_CANDIDATES if c in stratified.columns), None)
+
+    if age_col is None and sex_col is None:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["Stratum"] = stratified["ce_assigned_strata"].astype(str).map(
+        lambda k: STRATA_MAP.get(k, k)
+    )
+
+    if age_col is not None:
+        out["Age"] = pd.to_numeric(stratified[age_col], errors="coerce")
+    if sex_col is not None:
+        out["Sex"] = stratified[sex_col].astype(str).map(lambda k: SEX_MAP.get(k, k))
+
+    return out
+
+
+def build_weekly_enrollment_trends(df_clinical):
+    """Weekly enrollment count and cumulative stratified-enrollment trend.
+
+    Uses `ce_date` (clinical evaluation date) as the enrollment-event date
+    since it's the date field carried on the clinical eligibility form.
+    - "Enrolled" = rows where ce_enrollment_decision == "1"
+    - "Stratified" = rows where ce_assigned_strata is populated
+    Returns (weekly_enrollment_df, cumulative_stratified_df), each empty if
+    the required fields aren't present.
+    """
+    empty = (pd.DataFrame(), pd.DataFrame())
+    if df_clinical.empty or "ce_date" not in df_clinical.columns:
+        return empty
+
+    df = df_clinical.copy()
+    df["ce_date_parsed"] = pd.to_datetime(df["ce_date"], errors="coerce")
+    df = df[df["ce_date_parsed"].notna()]
+    if df.empty:
+        return empty
+
+    df["week"] = df["ce_date_parsed"].dt.to_period("W").apply(lambda p: p.start_time)
+
+    weekly_enrollment = pd.DataFrame()
+    if "ce_enrollment_decision" in df.columns:
+        enrolled = df[df["ce_enrollment_decision"] == "1"]
+        if not enrolled.empty:
+            weekly_enrollment = (
+                enrolled.groupby("week").size().reset_index(name="Enrollments")
+                .sort_values("week")
+            )
+            weekly_enrollment["Week"] = weekly_enrollment["week"].dt.strftime("%Y-%m-%d")
+
+    cumulative_stratified = pd.DataFrame()
+    if "ce_assigned_strata" in df.columns:
+        stratified = df[
+            df["ce_assigned_strata"].notna() & (df["ce_assigned_strata"] != "")
+        ]
+        if not stratified.empty:
+            weekly_counts = (
+                stratified.groupby("week").size().reset_index(name="Count")
+                .sort_values("week")
+            )
+            weekly_counts["Cumulative Stratified"] = weekly_counts["Count"].cumsum()
+            weekly_counts["Week"] = weekly_counts["week"].dt.strftime("%Y-%m-%d")
+            cumulative_stratified = weekly_counts
+
+    return weekly_enrollment, cumulative_stratified
+
+
+def build_weekly_retention(visit_matrix):
+    """Retention rate per visit week: Completed / (Completed + Missed + Rescheduled).
+
+    Pending and Early Term rows are excluded from both numerator and
+    denominator since they aren't yet a completed-or-failed outcome.
+    """
+    if visit_matrix.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for week in VISIT_WINDOW_ORDER:
+        if week not in visit_matrix.columns:
+            continue
+        counts = visit_matrix[week].value_counts()
+        completed = int(counts.get("Completed", 0))
+        missed = int(counts.get("Missed", 0))
+        rescheduled = int(counts.get("Rescheduled", 0))
+        denominator = completed + missed + rescheduled
+        retention_pct = (completed / denominator * 100) if denominator > 0 else None
+        rows.append(
+            {
+                "Week": week,
+                "Completed": completed,
+                "Missed": missed,
+                "Rescheduled": rescheduled,
+                "Denominator": denominator,
+                "Retention %": round(retention_pct, 1) if retention_pct is not None else None,
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def get_safety_screening_summary(df_clinical):
@@ -480,9 +617,7 @@ def main():
             "Select View",
             [
                 "Dashboard",
-                "Enrollment Funnel",
                 "Visit Matrix",
-                "Safety Screening",
                 "Alerts",
                 "Shareable Summary",
             ],
@@ -560,6 +695,9 @@ def main():
     overdue = get_overdue_visits(df_clinical, df_visits)
     safety = get_safety_screening_summary(df_clinical)
     strata_summary = build_stratification_summary(df_clinical)
+    strata_demographics = build_stratified_demographics(df_clinical)
+    weekly_enrollment, cumulative_stratified = build_weekly_enrollment_trends(df_clinical)
+    weekly_retention = build_weekly_retention(visit_matrix)
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
@@ -610,15 +748,16 @@ def main():
                 ],
             }
         )
+        viridis_colors = px.colors.sample_colorscale(
+            "Viridis", [i / (len(funnel_data) - 1) for i in range(len(funnel_data))]
+        )
         fig_funnel = go.Figure(
             go.Funnel(
                 y=funnel_data["Stage"],
                 x=funnel_data["Count"],
                 textposition="inside",
                 textinfo="value+percent initial",
-                marker={
-                    "color": ["#1f4e79", "#2e7d32", "#f57c00", "#7b1fa2", "#c62828"]
-                },
+                marker={"color": viridis_colors},
             )
         )
         fig_funnel.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=400)
@@ -636,15 +775,18 @@ def main():
                 )
                 fig_strata = px.bar(
                     strata_summary,
-                    x="Stratum",
-                    y="Count",
+                    x="Count",
+                    y="Stratum",
                     color="Stratum",
                     text="Count",
+                    orientation="h",
                     labels={"Count": "Participants"},
                     height=280,
                 )
                 fig_strata.update_layout(
-                    showlegend=False, margin=dict(l=20, r=20, t=10, b=20)
+                    showlegend=False,
+                    margin=dict(l=20, r=20, t=10, b=20),
+                    yaxis=dict(categoryorder="total ascending"),
                 )
                 st.plotly_chart(fig_strata, use_container_width=True)
             else:
@@ -682,6 +824,87 @@ def main():
 
         st.markdown("---")
 
+        st.subheader("Stratified Participant Demographics")
+        if not strata_demographics.empty and (
+            "Age" in strata_demographics.columns or "Sex" in strata_demographics.columns
+        ):
+            demo_col1, demo_col2 = st.columns(2)
+
+            with demo_col1:
+                if "Age" in strata_demographics.columns:
+                    fig_age = px.histogram(
+                        strata_demographics,
+                        x="Age",
+                        color="Stratum",
+                        nbins=15,
+                        labels={"Age": "Age (years)"},
+                        height=340,
+                    )
+                    fig_age.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+                    st.plotly_chart(fig_age, use_container_width=True)
+                else:
+                    st.info("No age field found — check AGE_FIELD_CANDIDATES.")
+
+            with demo_col2:
+                if "Sex" in strata_demographics.columns:
+                    sex_counts = (
+                        strata_demographics.groupby(["Stratum", "Sex"])
+                        .size()
+                        .reset_index(name="Count")
+                    )
+                    fig_sex = px.bar(
+                        sex_counts,
+                        x="Stratum",
+                        y="Count",
+                        color="Sex",
+                        barmode="group",
+                        height=340,
+                    )
+                    fig_sex.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+                    st.plotly_chart(fig_sex, use_container_width=True)
+                else:
+                    st.info("No sex field found — check SEX_FIELD_CANDIDATES.")
+        else:
+            st.info(
+                "No age/sex fields detected for stratified participants. "
+                "Update AGE_FIELD_CANDIDATES / SEX_FIELD_CANDIDATES to match your data dictionary."
+            )
+
+        st.markdown("---")
+
+        trend_col1, trend_col2 = st.columns(2)
+
+        with trend_col1:
+            st.subheader("Cumulative Stratified Enrollment (by Week)")
+            if not cumulative_stratified.empty:
+                fig_cum = px.line(
+                    cumulative_stratified,
+                    x="Week",
+                    y="Cumulative Stratified",
+                    markers=True,
+                    height=340,
+                )
+                fig_cum.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+                st.plotly_chart(fig_cum, use_container_width=True)
+            else:
+                st.info("No stratification date data available yet.")
+
+        with trend_col2:
+            st.subheader("Enrollments by Week")
+            if not weekly_enrollment.empty:
+                fig_weekly = px.bar(
+                    weekly_enrollment,
+                    x="Week",
+                    y="Enrollments",
+                    height=340,
+                )
+                fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+                st.plotly_chart(fig_weekly, use_container_width=True)
+            else:
+                st.info("No enrollment date data available yet.")
+
+        st.markdown("---")
+
         st.subheader("Action Required")
         alert_col1, alert_col2 = st.columns(2)
 
@@ -700,60 +923,6 @@ def main():
                 st.dataframe(upcoming, use_container_width=True, hide_index=True)
             else:
                 st.info("No visits scheduled in the next 7 days.")
-
-    # ═══════════════════════════════════════════════════════════
-    # VIEW: ENROLLMENT FUNNEL
-    # ═══════════════════════════════════════════════════════════
-    elif view_mode == "Enrollment Funnel":
-        st.markdown(
-            '<div class="main-header">Enrollment Funnel Details</div>',
-            unsafe_allow_html=True,
-        )
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Not Eligible (Pre-screen)", enrollment["not_eligible"])
-        col2.metric("Eligible but Declined", enrollment["declined"])
-        col3.metric(
-            "Screened Out (Behavioral)",
-            max(0, enrollment["enrolled"] - enrollment["clinically_eligible"]),
-        )
-
-        st.markdown("---")
-
-        if not df_prescreen.empty and "prescreening_outcome" in df_prescreen.columns:
-            st.subheader("Pre-Screening Outcomes")
-            outcome_counts = (
-                df_prescreen["prescreening_outcome"].value_counts().reset_index()
-            )
-            outcome_map = {
-                "1": "Eligible & Referred",
-                "2": "Eligible but Declined",
-                "3": "Not Eligible",
-            }
-            outcome_counts["Outcome"] = outcome_counts["prescreening_outcome"].map(
-                outcome_map
-            )
-            fig = px.pie(
-                outcome_counts,
-                values="count",
-                names="Outcome",
-                color_discrete_sequence=px.colors.sequential.Blues_r,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        if not df_prescreen.empty and "motivation_quit" in df_prescreen.columns:
-            st.subheader("Motivation to Quit Distribution")
-            df_prescreen["motivation_quit_num"] = pd.to_numeric(
-                df_prescreen["motivation_quit"], errors="coerce"
-            )
-            fig = px.histogram(
-                df_prescreen,
-                x="motivation_quit_num",
-                nbins=10,
-                labels={"motivation_quit_num": "Motivation Score (1-10)"},
-            )
-            fig.update_layout(bargap=0.1)
-            st.plotly_chart(fig, use_container_width=True)
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: VISIT MATRIX
@@ -788,81 +957,36 @@ def main():
                 file_name="soar_visit_matrix.csv",
                 mime="text/csv",
             )
-        else:
-            st.info("No visit data to display.")
-
-    # ═══════════════════════════════════════════════════════════
-    # VIEW: SAFETY SCREENING
-    # ═══════════════════════════════════════════════════════════
-    elif view_mode == "Safety Screening":
-        st.markdown(
-            '<div class="main-header">Safety Screening Summary</div>',
-            unsafe_allow_html=True,
-        )
-
-        if safety:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("MINI-S Eligible", safety.get("mini_eligible", 0))
-            c2.metric("MINI-S Screen Out", safety.get("mini_screenout", 0))
-            c3.metric("MINI High Risk (≥10)", safety.get("mini_high_risk", 0))
-
-            c4, c5, c6 = st.columns(3)
-            c4.metric("HHDS Eligible", safety.get("hhds_eligible", 0))
-            c5.metric("HHDS Screen Out", safety.get("hhds_screenout", 0))
-            c6.metric("AUDIT High (≥16)", safety.get("audit_high", 0))
 
             st.markdown("---")
 
-            if "strata_counts" in safety and safety["strata_counts"]:
-                st.subheader("Stratification Distribution")
-                strata_df = pd.DataFrame(
-                    {
-                        "Stratum": list(safety["strata_counts"].keys()),
-                        "Count": list(safety["strata_counts"].values()),
-                    }
+            st.subheader("Retention by Week")
+            st.markdown(
+                "Retention % = Completed ÷ (Completed + Missed + Rescheduled) "
+                "for each visit window."
+            )
+            if not weekly_retention.empty:
+                fig_retention = px.line(
+                    weekly_retention,
+                    x="Week",
+                    y="Retention %",
+                    markers=True,
+                    text="Retention %",
+                    height=380,
                 )
-                strata_map = {
-                    "1": "Low Smoking + Low Alcohol",
-                    "2": "Low Smoking + High Alcohol",
-                    "3": "High Smoking + Low Alcohol",
-                    "4": "High Smoking + High Alcohol",
-                }
-                strata_df["Stratum Label"] = strata_df["Stratum"].astype(str).map(strata_map)
-
-                fig = px.bar(
-                    strata_df,
-                    x="Stratum Label",
-                    y="Count",
-                    color="Stratum Label",
-                    labels={"Count": "Participants"},
-                    height=400,
+                fig_retention.update_traces(textposition="top center")
+                fig_retention.update_layout(
+                    yaxis=dict(range=[0, 105]),
+                    margin=dict(l=20, r=20, t=20, b=20),
                 )
-                st.plotly_chart(fig, use_container_width=True)
-
-            if (
-                not df_clinical.empty
-                and "ce_mini_total_score" in df_clinical.columns
-            ):
-                st.subheader("MINI-S Total Score Distribution")
-                df_clinical["mini_score_num"] = pd.to_numeric(
-                    df_clinical["ce_mini_total_score"], errors="coerce"
+                st.plotly_chart(fig_retention, use_container_width=True)
+                st.dataframe(
+                    weekly_retention, use_container_width=True, hide_index=True
                 )
-                fig = px.histogram(
-                    df_clinical,
-                    x="mini_score_num",
-                    nbins=20,
-                    labels={"mini_score_num": "MINI-S Total Score"},
-                    color_discrete_sequence=["#1f4e79"],
-                )
-                fig.add_vline(
-                    x=6, line_dash="dash", line_color="orange", annotation_text="Moderate"
-                )
-                fig.add_vline(
-                    x=10, line_dash="dash", line_color="red", annotation_text="High"
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Not enough visit outcome data to compute retention yet.")
         else:
-            st.info("No clinical evaluation data available.")
+            st.info("No visit data to display.")
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: ALERTS
@@ -953,7 +1077,7 @@ Alerts:
   - Overdue visits:         {len(overdue)}
   - Upcoming (7 days):      {len(upcoming)}
         """
-        st.text_area("Copy these stats to email/Slack/Teams", stats_text, height=300)
+        st.text_area("Copy these stats to email/Teams", stats_text, height=300)
 
 if __name__ == "__main__":
     main()
