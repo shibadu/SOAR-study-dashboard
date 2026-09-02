@@ -816,58 +816,90 @@ def main():
             with demo_col1:
                 if "Age" in strata_demographics.columns:
                     ages = strata_demographics["Age"].dropna()
-                    fig_age = px.histogram(
-                        strata_demographics,
-                        x="Age",
-                        nbins=15,
-                        labels={"Age": "Age (years)", "count": "Number of Participants"},
-                        height=340,
+                else:
+                    ages = pd.Series(dtype=float)
+
+                if not ages.empty:
+                    age_bins = [0, 30, 40, 50, 60, 150]
+                    age_labels = ["18-30", "31-40", "41-50", "51-60", "60+"]
+                    age_groups = pd.cut(ages, bins=age_bins, labels=age_labels)
+                    age_group_counts = age_groups.value_counts().reindex(age_labels, fill_value=0)
+                    total_age_n = int(age_group_counts.sum())
+                    age_pct = (age_group_counts / max(total_age_n, 1) * 100).round(1)
+
+                    age_colors = px.colors.sample_colorscale(
+                        "Viridis",
+                        [i / max(len(age_labels) - 1, 1) for i in range(len(age_labels))],
                     )
-                    if not ages.empty:
-                        median_age = ages.median()
-                        q1, q3 = ages.quantile(0.25), ages.quantile(0.75)
-                        fig_age.add_vrect(
-                            x0=q1, x1=q3,
-                            fillcolor="gray", opacity=0.2, line_width=0,
-                            annotation_text="IQR", annotation_position="top left",
+
+                    fig_age = go.Figure(
+                        go.Bar(
+                            x=age_labels,
+                            y=age_group_counts.values,
+                            text=[
+                                f"n={n}<br>({p}%)"
+                                for n, p in zip(age_group_counts.values, age_pct.values)
+                            ],
+                            textposition="outside",
+                            marker=dict(color=age_colors, line=dict(color="white", width=1)),
                         )
-                        fig_age.add_vline(
-                            x=median_age, line_dash="dash", line_color="white",
-                            annotation_text=f"Median: {median_age:.0f}",
-                            annotation_position="top",
-                        )
+                    )
+                    median_age = ages.median()
+                    q1, q3 = ages.quantile(0.25), ages.quantile(0.75)
                     fig_age.update_layout(
-                        margin=dict(l=20, r=20, t=30, b=20),
+                        title=f"Age Distribution (N={total_age_n})",
+                        xaxis_title="Age Group (years)",
                         yaxis_title="Number of Participants",
+                        margin=dict(l=20, r=20, t=40, b=20),
+                        height=360,
+                        showlegend=False,
                     )
                     st.plotly_chart(fig_age, use_container_width=True)
-                    if not ages.empty:
-                        st.caption(
-                            f"Median age: {median_age:.0f} years "
-                            f"(IQR: {q1:.0f}\u2013{q3:.0f}, n={len(ages)})"
-                        )
+                    st.caption(
+                        f"Median age: {median_age:.0f} years "
+                        f"(IQR: {q1:.0f}\u2013{q3:.0f}, n={len(ages)})"
+                    )
                 else:
                     st.info("No age field found — check AGE_FIELD_CANDIDATES.")
 
             with demo_col2:
                 if "Sex" in strata_demographics.columns:
                     sex_counts = (
-                        strata_demographics.groupby("Sex")
-                        .size()
-                        .reset_index(name="Count")
+                        strata_demographics["Sex"].dropna().value_counts().reset_index()
                     )
-                    fig_sex = px.pie(
-                        sex_counts,
-                        names="Sex",
-                        values="Count",
-                        labels={"Sex": "Gender"},
-                        height=340,
+                    sex_counts.columns = ["Sex", "Count"]
+                else:
+                    sex_counts = pd.DataFrame(columns=["Sex", "Count"])
+
+                if not sex_counts.empty:
+                    total_sex_n = int(sex_counts["Count"].sum())
+                    sex_pct = (sex_counts["Count"] / total_sex_n * 100).round(1)
+
+                    sex_colors = px.colors.sample_colorscale(
+                        "Viridis",
+                        [i / max(len(sex_counts) - 1, 1) for i in range(len(sex_counts))],
                     )
-                    fig_sex.update_traces(
-                        textinfo="label+percent+value",
-                        textposition="inside",
+
+                    fig_sex = go.Figure(
+                        go.Pie(
+                            labels=sex_counts["Sex"],
+                            values=sex_counts["Count"],
+                            text=[
+                                f"n={c}<br>({p}%)"
+                                for c, p in zip(sex_counts["Count"], sex_pct)
+                            ],
+                            textinfo="label+text",
+                            textposition="inside",
+                            pull=[0.03] * len(sex_counts),
+                            marker=dict(colors=sex_colors, line=dict(color="white", width=2)),
+                        )
                     )
-                    fig_sex.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+                    fig_sex.update_layout(
+                        title=f"Gender Distribution (N={total_sex_n})",
+                        margin=dict(l=20, r=20, t=40, b=20),
+                        height=360,
+                        legend_title_text="Gender",
+                    )
                     st.plotly_chart(fig_sex, use_container_width=True)
                 else:
                     st.info("No sex field found — check SEX_FIELD_CANDIDATES.")
@@ -937,9 +969,9 @@ def main():
                     status_counts.loc[status] = 0
 
             status_long = (
-                status_counts.T.reset_index()
-                .melt(id_vars="index", var_name="Status", value_name="Participants")
-                .rename(columns={"index": "Visit Window"})
+                status_counts.T.rename_axis("Visit Window")
+                .reset_index()
+                .melt(id_vars="Visit Window", var_name="Status", value_name="Participants")
             )
             status_long = status_long[status_long["Participants"] > 0]
 
