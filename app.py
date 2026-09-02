@@ -77,18 +77,6 @@ SEX_MAP = {"1": "Male", "2": "Female"}
 
 VISIT_WINDOW_ORDER = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
 
-AGE_GROUP_LABELS = ["18-30", "31-40", "41-50", "51-60", "60+"]
-AGE_GROUP_BINS = [17, 30, 40, 50, 60, float("inf")]
-
-
-def viridis_colors(n):
-    """Return n colors sampled evenly across the Viridis colorscale."""
-    if n <= 0:
-        return []
-    if n == 1:
-        return [px.colors.sample_colorscale("Viridis", [0.5])[0]]
-    return px.colors.sample_colorscale("Viridis", [i / (n - 1) for i in range(n)])
-
 # ───────────────────────────────────────────────────────────────
 # CONFIG & CONNECTION
 # ───────────────────────────────────────────────────────────────
@@ -471,39 +459,6 @@ def build_stratified_demographics(df_clinical, df_prescreen):
     return out
 
 
-def build_age_group_summary(ages):
-    """Bin ages into standard groups (18-30, 31-40, 41-50, 51-60, 60+) and
-    compute median/IQR summary stats. Returns (summary_df, stats_dict);
-    both empty/blank if there's no valid numeric age data.
-    """
-    ages_num = pd.to_numeric(ages, errors="coerce").dropna()
-    if ages_num.empty:
-        return pd.DataFrame(), {}
-
-    binned = pd.cut(ages_num, bins=AGE_GROUP_BINS, labels=AGE_GROUP_LABELS, right=True)
-    counts = binned.value_counts().reindex(AGE_GROUP_LABELS, fill_value=0)
-    total = int(counts.sum())
-
-    summary = pd.DataFrame(
-        {
-            "Age Group": AGE_GROUP_LABELS,
-            "Count": counts.values,
-            "Percent": (counts.values / total * 100).round(1) if total > 0 else 0,
-        }
-    )
-    summary["Label"] = summary.apply(
-        lambda r: f"n={int(r['Count'])} ({r['Percent']:.0f}%)", axis=1
-    )
-
-    stats = {
-        "total": total,
-        "median": round(ages_num.median(), 1),
-        "q1": round(ages_num.quantile(0.25), 1),
-        "q3": round(ages_num.quantile(0.75), 1),
-    }
-    return summary, stats
-
-
 def build_weekly_enrollment_trends(df_clinical):
     """Weekly enrollment count and cumulative stratified-enrollment trend.
 
@@ -825,14 +780,16 @@ def main():
                 ],
             }
         )
-        funnel_colors = viridis_colors(len(funnel_data))
+        viridis_colors = px.colors.sample_colorscale(
+            "Viridis", [i / (len(funnel_data) - 1) for i in range(len(funnel_data))]
+        )
         fig_funnel = go.Figure(
             go.Funnel(
                 y=funnel_data["Stage"],
                 x=funnel_data["Count"],
                 textposition="inside",
                 textinfo="value+percent initial",
-                marker={"color": funnel_colors},
+                marker={"color": viridis_colors},
             )
         )
         fig_funnel.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=400)
@@ -852,14 +809,11 @@ def main():
                     strata_summary,
                     x="Count",
                     y="Stratum",
+                    color="Stratum",
                     text="Count",
                     orientation="h",
                     labels={"Count": "Participants"},
                     height=280,
-                )
-                fig_strata.update_traces(
-                    marker_color=viridis_colors(len(strata_summary)),
-                    textposition="outside",
                 )
                 fig_strata.update_layout(
                     showlegend=False,
@@ -876,32 +830,22 @@ def main():
                 status_counts = (
                     visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
                 )
-                status_order = ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]
-                for status in status_order:
+                for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]:
                     if status not in status_counts.index:
                         status_counts.loc[status] = 0
 
-                adherence_long = (
-                    status_counts.T.reset_index()
-                    .rename(columns={"index": "Visit Window"})
-                    .melt(id_vars="Visit Window", var_name="Status", value_name="Participants")
-                )
-                status_color_map = dict(zip(status_order, viridis_colors(len(status_order))))
-
                 fig_adherence = px.bar(
-                    adherence_long,
-                    x="Visit Window",
-                    y="Participants",
-                    color="Status",
-                    color_discrete_map=status_color_map,
-                    category_orders={"Status": status_order, "Visit Window": VISIT_WINDOW_ORDER},
-                    text="Participants",
+                    status_counts.T,
                     barmode="stack",
+                    color_discrete_map={
+                        "Completed": "#2e7d32",
+                        "Pending": "#ffc107",
+                        "Missed": "#dc3545",
+                        "Rescheduled": "#17a2b8",
+                        "Early Term": "#6c757d",
+                    },
+                    labels={"value": "Participants", "index": "Visit Window"},
                     height=400,
-                )
-                fig_adherence.update_traces(
-                    texttemplate="%{text}",
-                    textposition="inside",
                 )
                 fig_adherence.update_layout(
                     margin=dict(l=20, r=20, t=30, b=20)
@@ -920,34 +864,16 @@ def main():
 
             with demo_col1:
                 if "Age" in strata_demographics.columns:
-                    age_summary, age_stats = build_age_group_summary(
-                        strata_demographics["Age"]
+                    fig_age = px.histogram(
+                        strata_demographics,
+                        x="Age",
+                        nbins=15,
+                        labels={"Age": "Age (years)"},
+                        color_discrete_sequence=["#1f4e79"],
+                        height=340,
                     )
-                    if not age_summary.empty:
-                        fig_age = px.bar(
-                            age_summary,
-                            x="Age Group",
-                            y="Count",
-                            text="Label",
-                            labels={"Count": "Participants"},
-                            title=f"Age Distribution (N={age_stats['total']})",
-                            height=380,
-                        )
-                        fig_age.update_traces(
-                            marker_color=viridis_colors(len(age_summary)),
-                            textposition="outside",
-                        )
-                        fig_age.update_layout(
-                            showlegend=False,
-                            margin=dict(l=20, r=20, t=60, b=20),
-                        )
-                        st.plotly_chart(fig_age, use_container_width=True)
-                        st.caption(
-                            f"Median age: {age_stats['median']} years "
-                            f"(IQR: {age_stats['q1']}–{age_stats['q3']})"
-                        )
-                    else:
-                        st.info("No valid age values to plot.")
+                    fig_age.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+                    st.plotly_chart(fig_age, use_container_width=True)
                 else:
                     st.info("No age field found — check AGE_FIELD_CANDIDATES.")
 
@@ -957,29 +883,16 @@ def main():
                         strata_demographics["Sex"].value_counts().reset_index()
                     )
                     sex_counts.columns = ["Sex", "Count"]
-                    total_sex = int(sex_counts["Count"].sum())
-                    sex_counts["Percent"] = (sex_counts["Count"] / total_sex * 100).round(1)
-                    sex_counts["Label"] = sex_counts.apply(
-                        lambda r: f"n={int(r['Count'])} ({r['Percent']:.0f}%)", axis=1
-                    )
-
-                    fig_sex = px.pie(
+                    fig_sex = px.bar(
                         sex_counts,
-                        names="Sex",
-                        values="Count",
-                        title=f"Sex Distribution (N={total_sex})",
-                        height=380,
-                    )
-                    fig_sex.update_traces(
-                        marker=dict(colors=viridis_colors(len(sex_counts))),
-                        pull=[0.05] * len(sex_counts),
-                        text=sex_counts["Label"],
-                        textinfo="text",
-                        textposition="outside",
+                        x="Sex",
+                        y="Count",
+                        color="Sex",
+                        text="Count",
+                        height=340,
                     )
                     fig_sex.update_layout(
-                        margin=dict(l=20, r=20, t=60, b=20),
-                        legend_title_text="Gender",
+                        showlegend=False, margin=dict(l=20, r=20, t=30, b=20)
                     )
                     st.plotly_chart(fig_sex, use_container_width=True)
                 else:
@@ -997,19 +910,12 @@ def main():
         with trend_col1:
             st.subheader("Cumulative Stratified Enrollment (by Week)")
             if not cumulative_stratified.empty:
-                trend_color = viridis_colors(3)[1]
                 fig_cum = px.line(
                     cumulative_stratified,
                     x="Week",
                     y="Cumulative Stratified",
                     markers=True,
-                    text="Cumulative Stratified",
                     height=340,
-                )
-                fig_cum.update_traces(
-                    textposition="top center",
-                    line_color=trend_color,
-                    marker=dict(color=trend_color, size=8),
                 )
                 fig_cum.update_layout(margin=dict(l=20, r=20, t=30, b=20))
                 st.plotly_chart(fig_cum, use_container_width=True)
@@ -1023,12 +929,7 @@ def main():
                     weekly_enrollment,
                     x="Week",
                     y="Enrollments",
-                    text="Enrollments",
                     height=340,
-                )
-                fig_weekly.update_traces(
-                    marker_color=viridis_colors(len(weekly_enrollment)),
-                    textposition="outside",
                 )
                 fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
                 st.plotly_chart(fig_weekly, use_container_width=True)
@@ -1098,7 +999,6 @@ def main():
                 "for each visit window."
             )
             if not weekly_retention.empty:
-                retention_color = viridis_colors(3)[1]
                 fig_retention = px.line(
                     weekly_retention,
                     x="Week",
@@ -1107,11 +1007,7 @@ def main():
                     text="Retention %",
                     height=380,
                 )
-                fig_retention.update_traces(
-                    textposition="top center",
-                    line_color=retention_color,
-                    marker=dict(color=retention_color, size=8),
-                )
+                fig_retention.update_traces(textposition="top center")
                 fig_retention.update_layout(
                     yaxis=dict(range=[0, 105]),
                     margin=dict(l=20, r=20, t=20, b=20),
