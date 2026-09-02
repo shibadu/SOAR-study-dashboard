@@ -775,14 +775,19 @@ def main():
 
         st.markdown("---")
 
+        st.subheader("Stratification Summary")
         col_left, col_right = st.columns([1, 1])
 
         with col_left:
-            st.subheader("Stratification Summary")
             if not strata_summary.empty:
                 st.dataframe(
                     strata_summary, use_container_width=True, hide_index=True
                 )
+            else:
+                st.info("No stratification data available yet.")
+
+        with col_right:
+            if not strata_summary.empty:
                 fig_strata = px.bar(
                     strata_summary,
                     x="Count",
@@ -799,38 +804,6 @@ def main():
                     yaxis=dict(categoryorder="total ascending"),
                 )
                 st.plotly_chart(fig_strata, use_container_width=True)
-            else:
-                st.info("No stratification data available yet.")
-
-        with col_right:
-            st.subheader("Visit Adherence Overview")
-            if not visit_matrix.empty:
-                status_counts = (
-                    visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
-                )
-                for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]:
-                    if status not in status_counts.index:
-                        status_counts.loc[status] = 0
-
-                fig_adherence = px.bar(
-                    status_counts.T,
-                    barmode="stack",
-                    color_discrete_map={
-                        "Completed": "#2e7d32",
-                        "Pending": "#ffc107",
-                        "Missed": "#dc3545",
-                        "Rescheduled": "#17a2b8",
-                        "Early Term": "#6c757d",
-                    },
-                    labels={"value": "Participants", "index": "Visit Window"},
-                    height=400,
-                )
-                fig_adherence.update_layout(
-                    margin=dict(l=20, r=20, t=30, b=20)
-                )
-                st.plotly_chart(fig_adherence, use_container_width=True)
-            else:
-                st.info("No visit data available yet.")
 
         st.markdown("---")
 
@@ -842,6 +815,7 @@ def main():
 
             with demo_col1:
                 if "Age" in strata_demographics.columns:
+                    ages = strata_demographics["Age"].dropna()
                     fig_age = px.histogram(
                         strata_demographics,
                         x="Age",
@@ -849,11 +823,29 @@ def main():
                         labels={"Age": "Age (years)", "count": "Number of Participants"},
                         height=340,
                     )
+                    if not ages.empty:
+                        median_age = ages.median()
+                        q1, q3 = ages.quantile(0.25), ages.quantile(0.75)
+                        fig_age.add_vrect(
+                            x0=q1, x1=q3,
+                            fillcolor="gray", opacity=0.2, line_width=0,
+                            annotation_text="IQR", annotation_position="top left",
+                        )
+                        fig_age.add_vline(
+                            x=median_age, line_dash="dash", line_color="white",
+                            annotation_text=f"Median: {median_age:.0f}",
+                            annotation_position="top",
+                        )
                     fig_age.update_layout(
                         margin=dict(l=20, r=20, t=30, b=20),
                         yaxis_title="Number of Participants",
                     )
                     st.plotly_chart(fig_age, use_container_width=True)
+                    if not ages.empty:
+                        st.caption(
+                            f"Median age: {median_age:.0f} years "
+                            f"(IQR: {q1:.0f}\u2013{q3:.0f}, n={len(ages)})"
+                        )
                 else:
                     st.info("No age field found — check AGE_FIELD_CANDIDATES.")
 
@@ -864,13 +856,16 @@ def main():
                         .size()
                         .reset_index(name="Count")
                     )
-                    fig_sex = px.bar(
+                    fig_sex = px.pie(
                         sex_counts,
-                        x="Sex",
-                        y="Count",
-                        text="Count",
-                        labels={"Sex": "Gender", "Count": "Number of Participants"},
+                        names="Sex",
+                        values="Count",
+                        labels={"Sex": "Gender"},
                         height=340,
+                    )
+                    fig_sex.update_traces(
+                        textinfo="label+percent+value",
+                        textposition="inside",
                     )
                     fig_sex.update_layout(margin=dict(l=20, r=20, t=30, b=20))
                     st.plotly_chart(fig_sex, use_container_width=True)
@@ -894,12 +889,15 @@ def main():
                     x="Week",
                     y="Cumulative Stratified",
                     markers=True,
+                    text="Cumulative Stratified",
                     labels={
                         "Week": "Week Starting",
                         "Cumulative Stratified": "Cumulative Participants Stratified",
                     },
                     height=340,
+                    color_discrete_sequence=[px.colors.sequential.Viridis[4]],
                 )
+                fig_cum.update_traces(textposition="top center")
                 fig_cum.update_layout(margin=dict(l=20, r=20, t=30, b=20))
                 st.plotly_chart(fig_cum, use_container_width=True)
             else:
@@ -912,13 +910,60 @@ def main():
                     weekly_enrollment,
                     x="Week",
                     y="Enrollments",
+                    text="Enrollments",
+                    color="Enrollments",
+                    color_continuous_scale="Viridis",
                     labels={"Week": "Week Starting", "Enrollments": "Participants Enrolled"},
                     height=340,
                 )
-                fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+                fig_weekly.update_traces(textposition="outside")
+                fig_weekly.update_layout(
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    coloraxis_showscale=False,
+                )
                 st.plotly_chart(fig_weekly, use_container_width=True)
             else:
                 st.info("No enrollment date data available yet.")
+
+        st.markdown("---")
+
+        st.subheader("Visit Adherence Overview")
+        if not visit_matrix.empty:
+            status_counts = (
+                visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
+            )
+            for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Termination"]:
+                if status not in status_counts.index:
+                    status_counts.loc[status] = 0
+
+            status_long = (
+                status_counts.T.reset_index()
+                .melt(id_vars="index", var_name="Status", value_name="Participants")
+                .rename(columns={"index": "Visit Window"})
+            )
+            status_long = status_long[status_long["Participants"] > 0]
+
+            fig_adherence = px.bar(
+                status_long,
+                x="Visit Window",
+                y="Participants",
+                color="Status",
+                text="Participants",
+                barmode="stack",
+                color_discrete_map={
+                    "Completed": "#2e7d32",
+                    "Pending": "#ffc107",
+                    "Missed": "#dc3545",
+                    "Rescheduled": "#17a2b8",
+                    "Early Termination": "#6c757d",
+                },
+                height=420,
+            )
+            fig_adherence.update_traces(textposition="inside")
+            fig_adherence.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+            st.plotly_chart(fig_adherence, use_container_width=True)
+        else:
+            st.info("No visit data available yet.")
 
         st.markdown("---")
 
@@ -958,7 +1003,7 @@ def main():
                     "Pending": "background-color: #d39e00; color: white",
                     "Missed": "background-color: #a71d2a; color: white",
                     "Rescheduled": "background-color: #117a8b; color: white",
-                    "Early Term": "background-color: #495057; color: white",
+                    "Early Termination": "background-color: #495057; color: white",
                 }
                 return colors.get(val, "")
 
