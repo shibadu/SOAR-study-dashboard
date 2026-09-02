@@ -68,12 +68,11 @@ STRATA_MAP = {
     "4": "High Smoking + High Alcohol",
 }
 
-# Field names confirmed against the SOAR Study data dictionary
-# (SOARStudyScreeningTool_DataDictionary_2026-05-11) and the live REDCap export:
-#   - pre_screen_age / prescreen_age: calc field on the pre_screening form, "Age (years)"
-#   - gender: radio field on the pre_screening form, "Gender:" -> 1=Male, 2=Female
-AGE_FIELD_CANDIDATES = ["pre_screen_age", "prescreen_age", "age", "participant_age", "ce_age", "demo_age", "age_years"]
-SEX_FIELD_CANDIDATES = ["gender", "sex", "participant_sex", "ce_sex", "demo_sex"]
+# Age and gender fields, per the SOAR data dictionary (pre_screening form):
+#   prescreen_age (calc, years) — round(datediff([prescreen_dob], "today", "d") / 365.25, 0)
+#   gender (radio) — 1=Male, 2=Female
+AGE_FIELD_CANDIDATES = ["prescreen_age", "age", "participant_age"]
+SEX_FIELD_CANDIDATES = ["gender", "sex", "participant_sex"]
 SEX_MAP = {"1": "Male", "2": "Female"}
 
 VISIT_WINDOW_ORDER = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
@@ -392,15 +391,16 @@ def build_stratification_summary(df_clinical):
     return summary.sort_values("Stratum").reset_index(drop=True)
 
 
-def build_stratified_demographics(df_clinical):
-    """Age & sex data for participants who have an assigned stratum.
+def build_stratified_demographics(df_clinical, df_prescreen):
+    """Age & sex breakdown for participants who have an assigned stratum.
 
-    Looks for the field names in AGE_FIELD_CANDIDATES / SEX_FIELD_CANDIDATES
-    (see SHARED CONSTANTS) and uses the first one present in the data.
-    Returns an empty DataFrame if neither field is found.
-
-    Note: the "Stratum" column is kept in the output for reference, but the
-    Age/Sex charts built from this data are plain (not split by stratum).
+    Per the SOAR data dictionary, age (prescreen_age) and gender are
+    collected on the pre_screening form, while stratum assignment
+    (ce_assigned_strata) is on the clinical_evaluation form. In a
+    REDCap longitudinal/repeating-instruments export those live on
+    different rows, so this joins the two on record_id. Falls back to
+    looking on df_clinical directly (classic, non-repeating export)
+    if the fields aren't found on df_prescreen.
     """
     if df_clinical.empty or "ce_assigned_strata" not in df_clinical.columns:
         return pd.DataFrame()
@@ -413,23 +413,48 @@ def build_stratified_demographics(df_clinical):
     if stratified.empty:
         return pd.DataFrame()
 
-    age_col = next((c for c in AGE_FIELD_CANDIDATES if c in stratified.columns), None)
-    sex_col = next((c for c in SEX_FIELD_CANDIDATES if c in stratified.columns), None)
+    clin_id_col = "record_id" if "record_id" in stratified.columns else stratified.columns[0]
+
+    age_col = next((c for c in AGE_FIELD_CANDIDATES if c in df_prescreen.columns), None)
+    sex_col = next((c for c in SEX_FIELD_CANDIDATES if c in df_prescreen.columns), None)
+
+    if age_col is not None or sex_col is not None:
+        demo_source = df_prescreen
+        demo_id_col = (
+            "record_id" if "record_id" in df_prescreen.columns else df_prescreen.columns[0]
+        )
+    else:
+        # Fall back to df_clinical itself in case forms share rows.
+        age_col = next((c for c in AGE_FIELD_CANDIDATES if c in stratified.columns), None)
+        sex_col = next((c for c in SEX_FIELD_CANDIDATES if c in stratified.columns), None)
+        demo_source = stratified
+        demo_id_col = clin_id_col
 
     if age_col is None and sex_col is None:
         return pd.DataFrame()
 
+    demo_cols = [demo_id_col] + [c for c in [age_col, sex_col] if c is not None]
+    demo = (
+        demo_source[demo_cols]
+        .dropna(subset=[demo_id_col])
+        .drop_duplicates(subset=[demo_id_col], keep="first")
+        .rename(columns={demo_id_col: clin_id_col})
+    )
+
+    merged = stratified[[clin_id_col, "ce_assigned_strata"]].merge(
+        demo, on=clin_id_col, how="left"
+    )
+
     out = pd.DataFrame()
-    out["Stratum"] = stratified["ce_assigned_strata"].astype(str).map(
+    out["Stratum"] = merged["ce_assigned_strata"].astype(str).map(
         lambda k: STRATA_MAP.get(k, k)
     )
 
     if age_col is not None:
-        out["Age"] = pd.to_numeric(stratified[age_col], errors="coerce")
+        out["Age"] = pd.to_numeric(merged[age_col], errors="coerce")
     if sex_col is not None:
-        out["Sex"] = stratified[sex_col].astype(str).map(
-            lambda k: SEX_MAP.get(k, "Unknown" if k in ("", "nan", "0") else f"Unknown ({k})")
-        )
+        out["Sex"] = merged[sex_col].astype(str).map(lambda k: SEX_MAP.get(k, k))
+
 
     return out
 
@@ -702,7 +727,7 @@ def main():
     overdue = get_overdue_visits(df_clinical, df_visits)
     safety = get_safety_screening_summary(df_clinical)
     strata_summary = build_stratification_summary(df_clinical)
-    strata_demographics = build_stratified_demographics(df_clinical)
+    strata_demographics = build_stratified_demographics(df_clinical, df_prescreen)
     weekly_enrollment, cumulative_stratified = build_weekly_enrollment_trends(df_clinical)
     weekly_retention = build_weekly_retention(visit_matrix)
 
@@ -767,29 +792,19 @@ def main():
                 marker={"color": viridis_colors},
             )
         )
-        fig_funnel.update_layout(
-            margin=dict(l=20, r=20, t=30, b=20),
-            height=400,
-            xaxis_title="Participants",
-            yaxis_title="Enrollment Stage",
-        )
+        fig_funnel.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=400)
         st.plotly_chart(fig_funnel, use_container_width=True)
 
         st.markdown("---")
 
-        st.subheader("Stratification Summary")
         col_left, col_right = st.columns([1, 1])
 
         with col_left:
+            st.subheader("Stratification Summary")
             if not strata_summary.empty:
                 st.dataframe(
                     strata_summary, use_container_width=True, hide_index=True
                 )
-            else:
-                st.info("No stratification data available yet.")
-
-        with col_right:
-            if not strata_summary.empty:
                 fig_strata = px.bar(
                     strata_summary,
                     x="Count",
@@ -806,6 +821,38 @@ def main():
                     yaxis=dict(categoryorder="total ascending"),
                 )
                 st.plotly_chart(fig_strata, use_container_width=True)
+            else:
+                st.info("No stratification data available yet.")
+
+        with col_right:
+            st.subheader("Visit Adherence Overview")
+            if not visit_matrix.empty:
+                status_counts = (
+                    visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
+                )
+                for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]:
+                    if status not in status_counts.index:
+                        status_counts.loc[status] = 0
+
+                fig_adherence = px.bar(
+                    status_counts.T,
+                    barmode="stack",
+                    color_discrete_map={
+                        "Completed": "#2e7d32",
+                        "Pending": "#ffc107",
+                        "Missed": "#dc3545",
+                        "Rescheduled": "#17a2b8",
+                        "Early Term": "#6c757d",
+                    },
+                    labels={"value": "Participants", "index": "Visit Window"},
+                    height=400,
+                )
+                fig_adherence.update_layout(
+                    margin=dict(l=20, r=20, t=30, b=20)
+                )
+                st.plotly_chart(fig_adherence, use_container_width=True)
+            else:
+                st.info("No visit data available yet.")
 
         st.markdown("---")
 
@@ -817,90 +864,35 @@ def main():
 
             with demo_col1:
                 if "Age" in strata_demographics.columns:
-                    ages = strata_demographics["Age"].dropna()
-                else:
-                    ages = pd.Series(dtype=float)
-
-                if not ages.empty:
-                    age_bins = [0, 30, 40, 50, 60, 150]
-                    age_labels = ["18-30", "31-40", "41-50", "51-60", "60+"]
-                    age_groups = pd.cut(ages, bins=age_bins, labels=age_labels)
-                    age_group_counts = age_groups.value_counts().reindex(age_labels, fill_value=0)
-                    total_age_n = int(age_group_counts.sum())
-                    age_pct = (age_group_counts / max(total_age_n, 1) * 100).round(1)
-
-                    age_colors = px.colors.sample_colorscale(
-                        "Viridis",
-                        [i / max(len(age_labels) - 1, 1) for i in range(len(age_labels))],
+                    fig_age = px.histogram(
+                        strata_demographics,
+                        x="Age",
+                        nbins=15,
+                        labels={"Age": "Age (years)"},
+                        color_discrete_sequence=["#1f4e79"],
+                        height=340,
                     )
-
-                    fig_age = go.Figure(
-                        go.Bar(
-                            x=age_labels,
-                            y=age_group_counts.values,
-                            text=[
-                                f"n={n}<br>({p}%)"
-                                for n, p in zip(age_group_counts.values, age_pct.values)
-                            ],
-                            textposition="outside",
-                            marker=dict(color=age_colors, line=dict(color="white", width=1)),
-                        )
-                    )
-                    median_age = ages.median()
-                    q1, q3 = ages.quantile(0.25), ages.quantile(0.75)
-                    fig_age.update_layout(
-                        title=f"Age Distribution (N={total_age_n})",
-                        xaxis_title="Age Group (years)",
-                        yaxis_title="Number of Participants",
-                        margin=dict(l=20, r=20, t=40, b=20),
-                        height=360,
-                        showlegend=False,
-                    )
+                    fig_age.update_layout(margin=dict(l=20, r=20, t=30, b=20))
                     st.plotly_chart(fig_age, use_container_width=True)
-                    st.caption(
-                        f"Median age: {median_age:.0f} years "
-                        f"(IQR: {q1:.0f}\u2013{q3:.0f}, n={len(ages)})"
-                    )
                 else:
                     st.info("No age field found — check AGE_FIELD_CANDIDATES.")
 
             with demo_col2:
                 if "Sex" in strata_demographics.columns:
                     sex_counts = (
-                        strata_demographics["Sex"].dropna().value_counts().reset_index()
+                        strata_demographics["Sex"].value_counts().reset_index()
                     )
                     sex_counts.columns = ["Sex", "Count"]
-                else:
-                    sex_counts = pd.DataFrame(columns=["Sex", "Count"])
-
-                if not sex_counts.empty:
-                    total_sex_n = int(sex_counts["Count"].sum())
-                    sex_pct = (sex_counts["Count"] / total_sex_n * 100).round(1)
-
-                    sex_colors = px.colors.sample_colorscale(
-                        "Viridis",
-                        [i / max(len(sex_counts) - 1, 1) for i in range(len(sex_counts))],
-                    )
-
-                    fig_sex = go.Figure(
-                        go.Pie(
-                            labels=sex_counts["Sex"],
-                            values=sex_counts["Count"],
-                            text=[
-                                f"n={c}<br>({p}%)"
-                                for c, p in zip(sex_counts["Count"], sex_pct)
-                            ],
-                            textinfo="label+text",
-                            textposition="inside",
-                            pull=[0.03] * len(sex_counts),
-                            marker=dict(colors=sex_colors, line=dict(color="white", width=2)),
-                        )
+                    fig_sex = px.bar(
+                        sex_counts,
+                        x="Sex",
+                        y="Count",
+                        color="Sex",
+                        text="Count",
+                        height=340,
                     )
                     fig_sex.update_layout(
-                        title=f"Gender Distribution (N={total_sex_n})",
-                        margin=dict(l=20, r=20, t=40, b=20),
-                        height=360,
-                        legend_title_text="Gender",
+                        showlegend=False, margin=dict(l=20, r=20, t=30, b=20)
                     )
                     st.plotly_chart(fig_sex, use_container_width=True)
                 else:
@@ -923,15 +915,8 @@ def main():
                     x="Week",
                     y="Cumulative Stratified",
                     markers=True,
-                    text="Cumulative Stratified",
-                    labels={
-                        "Week": "Week Starting",
-                        "Cumulative Stratified": "Cumulative Participants Stratified",
-                    },
                     height=340,
-                    color_discrete_sequence=[px.colors.sequential.Viridis[4]],
                 )
-                fig_cum.update_traces(textposition="top center")
                 fig_cum.update_layout(margin=dict(l=20, r=20, t=30, b=20))
                 st.plotly_chart(fig_cum, use_container_width=True)
             else:
@@ -944,60 +929,12 @@ def main():
                     weekly_enrollment,
                     x="Week",
                     y="Enrollments",
-                    text="Enrollments",
-                    color="Enrollments",
-                    color_continuous_scale="Viridis",
-                    labels={"Week": "Week Starting", "Enrollments": "Participants Enrolled"},
                     height=340,
                 )
-                fig_weekly.update_traces(textposition="outside")
-                fig_weekly.update_layout(
-                    margin=dict(l=20, r=20, t=30, b=20),
-                    coloraxis_showscale=False,
-                )
+                fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
                 st.plotly_chart(fig_weekly, use_container_width=True)
             else:
                 st.info("No enrollment date data available yet.")
-
-        st.markdown("---")
-
-        st.subheader("Visit Adherence Overview")
-        if not visit_matrix.empty:
-            status_counts = (
-                visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
-            )
-            for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]:
-                if status not in status_counts.index:
-                    status_counts.loc[status] = 0
-
-            status_long = (
-                status_counts.T.rename_axis("Visit Window")
-                .reset_index()
-                .melt(id_vars="Visit Window", var_name="Status", value_name="Participants")
-            )
-            status_long = status_long[status_long["Participants"] > 0]
-
-            fig_adherence = px.bar(
-                status_long,
-                x="Visit Window",
-                y="Participants",
-                color="Status",
-                text="Participants",
-                barmode="stack",
-                color_discrete_map={
-                    "Completed": "#2e7d32",
-                    "Pending": "#ffc107",
-                    "Missed": "#dc3545",
-                    "Rescheduled": "#17a2b8",
-                    "Early Term": "#6c757d",
-                },
-                height=420,
-            )
-            fig_adherence.update_traces(textposition="inside")
-            fig_adherence.update_layout(margin=dict(l=20, r=20, t=30, b=20))
-            st.plotly_chart(fig_adherence, use_container_width=True)
-        else:
-            st.info("No visit data available yet.")
 
         st.markdown("---")
 
@@ -1173,7 +1110,7 @@ Alerts:
   - Overdue visits:         {len(overdue)}
   - Upcoming (7 days):      {len(upcoming)}
         """
-        st.text_area("Copy these stats to email/Teams", stats_text, height=300)
+        st.text_area("Copy these stats to email/Slack/Teams", stats_text, height=300)
 
 if __name__ == "__main__":
     main()
