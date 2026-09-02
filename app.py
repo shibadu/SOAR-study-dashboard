@@ -68,11 +68,13 @@ STRATA_MAP = {
     "4": "High Smoking + High Alcohol",
 }
 
-# NOTE: verify these two lists (and the SEX_MAP coding below) against your
-# REDCap data dictionary and adjust the field/value names if they differ.
-AGE_FIELD_CANDIDATES = ["age", "participant_age", "ce_age", "demo_age", "age_years"]
-SEX_FIELD_CANDIDATES = ["sex", "gender", "participant_sex", "ce_sex", "demo_sex"]
-SEX_MAP = {"1": "Male", "2": "Female", "3": "Other"}
+# Field names confirmed against the SOAR Study data dictionary
+# (SOARStudyScreeningTool_DataDictionary_2026-05-11):
+#   - prescreen_age: calc field on the pre_screening form, "Age (years)"
+#   - gender: radio field on the pre_screening form, "Gender:" -> 1=Male, 2=Female
+AGE_FIELD_CANDIDATES = ["prescreen_age", "age", "participant_age", "ce_age", "demo_age", "age_years"]
+SEX_FIELD_CANDIDATES = ["gender", "sex", "participant_sex", "ce_sex", "demo_sex"]
+SEX_MAP = {"1": "Male", "2": "Female"}
 
 VISIT_WINDOW_ORDER = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
 
@@ -391,11 +393,14 @@ def build_stratification_summary(df_clinical):
 
 
 def build_stratified_demographics(df_clinical):
-    """Age & sex breakdown for participants who have an assigned stratum.
+    """Age & sex data for participants who have an assigned stratum.
 
     Looks for the field names in AGE_FIELD_CANDIDATES / SEX_FIELD_CANDIDATES
     (see SHARED CONSTANTS) and uses the first one present in the data.
     Returns an empty DataFrame if neither field is found.
+
+    Note: the "Stratum" column is kept in the output for reference, but the
+    Age/Sex charts built from this data are plain (not split by stratum).
     """
     if df_clinical.empty or "ce_assigned_strata" not in df_clinical.columns:
         return pd.DataFrame()
@@ -760,7 +765,12 @@ def main():
                 marker={"color": viridis_colors},
             )
         )
-        fig_funnel.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=400)
+        fig_funnel.update_layout(
+            margin=dict(l=20, r=20, t=30, b=20),
+            height=400,
+            xaxis_title="Participants",
+            yaxis_title="Enrollment Stage",
+        )
         st.plotly_chart(fig_funnel, use_container_width=True)
 
         st.markdown("---")
@@ -835,12 +845,14 @@ def main():
                     fig_age = px.histogram(
                         strata_demographics,
                         x="Age",
-                        color="Stratum",
                         nbins=15,
-                        labels={"Age": "Age (years)"},
+                        labels={"Age": "Age (years)", "count": "Number of Participants"},
                         height=340,
                     )
-                    fig_age.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+                    fig_age.update_layout(
+                        margin=dict(l=20, r=20, t=30, b=20),
+                        yaxis_title="Number of Participants",
+                    )
                     st.plotly_chart(fig_age, use_container_width=True)
                 else:
                     st.info("No age field found — check AGE_FIELD_CANDIDATES.")
@@ -848,16 +860,16 @@ def main():
             with demo_col2:
                 if "Sex" in strata_demographics.columns:
                     sex_counts = (
-                        strata_demographics.groupby(["Stratum", "Sex"])
+                        strata_demographics.groupby("Sex")
                         .size()
                         .reset_index(name="Count")
                     )
                     fig_sex = px.bar(
                         sex_counts,
-                        x="Stratum",
+                        x="Sex",
                         y="Count",
-                        color="Sex",
-                        barmode="group",
+                        text="Count",
+                        labels={"Sex": "Gender", "Count": "Number of Participants"},
                         height=340,
                     )
                     fig_sex.update_layout(margin=dict(l=20, r=20, t=30, b=20))
@@ -882,6 +894,10 @@ def main():
                     x="Week",
                     y="Cumulative Stratified",
                     markers=True,
+                    labels={
+                        "Week": "Week Starting",
+                        "Cumulative Stratified": "Cumulative Participants Stratified",
+                    },
                     height=340,
                 )
                 fig_cum.update_layout(margin=dict(l=20, r=20, t=30, b=20))
@@ -896,6 +912,7 @@ def main():
                     weekly_enrollment,
                     x="Week",
                     y="Enrollments",
+                    labels={"Week": "Week Starting", "Enrollments": "Participants Enrolled"},
                     height=340,
                 )
                 fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
