@@ -932,7 +932,7 @@ def main():
             status_counts = (
                 visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
             )
-            for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Termination"]:
+            for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]:
                 if status not in status_counts.index:
                     status_counts.loc[status] = 0
 
@@ -955,7 +955,7 @@ def main():
                     "Pending": "#ffc107",
                     "Missed": "#dc3545",
                     "Rescheduled": "#17a2b8",
-                    "Early Termination": "#6c757d",
+                    "Early Term": "#6c757d",
                 },
                 height=420,
             )
@@ -1003,7 +1003,7 @@ def main():
                     "Pending": "background-color: #d39e00; color: white",
                     "Missed": "background-color: #a71d2a; color: white",
                     "Rescheduled": "background-color: #117a8b; color: white",
-                    "Early Termination": "background-color: #495057; color: white",
+                    "Early Term": "background-color: #495057; color: white",
                 }
                 return colors.get(val, "")
 
