@@ -20,6 +20,7 @@ import base64
 from datetime import datetime, timedelta
 from io import BytesIO
 
+import requests
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -41,8 +42,23 @@ st.set_page_config(
 # ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .main-header { font-size: 2.2rem; font-weight: 700; color: #1f4e79; }
-    .sub-header { font-size: 1.1rem; color: #555; margin-bottom: 1rem; }
+    /* Theme-adaptive headers: var(--text-color) tracks Streamlit's active
+       light/dark theme, and the accent blue + shadow keep contrast strong
+       against both a near-white and a near-black page background. */
+    .main-header {
+        font-size: 2.2rem;
+        font-weight: 800;
+        color: #4a90d9;
+        letter-spacing: 0.01em;
+        text-shadow: 0 1px 3px rgba(0,0,0,0.35);
+    }
+    .sub-header {
+        font-size: 1.1rem;
+        font-weight: 500;
+        color: var(--text-color, #555);
+        opacity: 0.85;
+        margin-bottom: 1rem;
+    }
     .metric-card { background: #f8f9fa; padding: 1rem; border-radius: 8px; border-left: 4px solid #1f4e79; }
     .alert-overdue { background: #fff3cd; padding: 0.5rem 1rem; border-radius: 6px; border-left: 4px solid #ffc107; }
     .alert-missed { background: #f8d7da; padding: 0.5rem 1rem; border-radius: 6px; border-left: 4px solid #dc3545; }
@@ -80,14 +96,48 @@ VISIT_WINDOW_ORDER = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
 AGE_GROUP_LABELS = ["18-30", "31-40", "41-50", "51-60", "60+"]
 AGE_GROUP_BINS = [17, 30, 40, 50, 60, float("inf")]
 
+# Shared "Behavioural Scheduler" workbook on SharePoint (PSF scheduler / DBA
+# sheets). Override via env var if the link ever changes. This link must have
+# "Anyone with the link" view/download sharing enabled — no auth is sent.
+SHAREPOINT_EXCEL_URL = os.getenv(
+    "SHAREPOINT_EXCEL_URL",
+    "https://cihebkenyaorg-my.sharepoint.com/:x:/r/personal/mondire_cihebkenya_org1/"
+    "_layouts/15/Doc.aspx?sourcedoc=%7B86734D1D-0DFF-41A8-9FAA-B1BC239944C2%7D"
+    "&file=Behavioural%20Scheduler%20July%202026%2CMA%2CJO%2CWM.xlsx"
+    "&fromShare=true&action=default&mobileredirect=true",
+)
+STUDY_ID_COL_CANDIDATES = ["study id", "study_id", "studyid"]
 
-def viridis_colors(n):
-    """Return n colors sampled evenly across the Viridis colorscale."""
+
+# Rocket colorscale stops (seaborn's "rocket" palette, sampled 0→1),
+# used in place of Viridis for all standard bar/line/pie charts.
+ROCKET_COLORSCALE = [
+    "#03051a", "#221331", "#451c47", "#691f55", "#921c5b", "#b91657",
+    "#d92847", "#ed503e", "#f47d57", "#f6a47c", "#f7c9aa", "#faebdd",
+]
+
+# Distinct 5-color palette (grey, blue, purple, orange, green) used only
+# for the Enrollment Funnel, which keeps its own scheme apart from Rocket.
+FUNNEL_COLORS = ["#6c757d", "#2980b9", "#8e44ad", "#e67e22", "#27ae60"]
+
+
+def rocket_colors(n):
+    """Return n colors sampled evenly across the Rocket colorscale."""
     if n <= 0:
         return []
     if n == 1:
-        return [px.colors.sample_colorscale("Viridis", [0.5])[0]]
-    return px.colors.sample_colorscale("Viridis", [i / (n - 1) for i in range(n)])
+        return [px.colors.sample_colorscale(ROCKET_COLORSCALE, [0.5])[0]]
+    return px.colors.sample_colorscale(ROCKET_COLORSCALE, [i / (n - 1) for i in range(n)])
+
+
+def funnel_palette(n):
+    """Return n colors for the funnel: grey/blue/purple/orange/green,
+    extended by sampling the same hues as a scale if more than 5 stages."""
+    if n <= 0:
+        return []
+    if n <= len(FUNNEL_COLORS):
+        return FUNNEL_COLORS[:n]
+    return px.colors.sample_colorscale(FUNNEL_COLORS, [i / (n - 1) for i in range(n)])
 
 # ───────────────────────────────────────────────────────────────
 # CONFIG & CONNECTION
@@ -132,6 +182,70 @@ def load_data(_proj):
     except Exception as e:
         st.error(f"Data export failed: {e}")
         return pd.DataFrame()
+
+
+def _sharepoint_direct_download_url(share_url):
+    """Turn a SharePoint 'anyone with the link' share URL into a direct
+    download URL by appending download=1 to the Doc.aspx query string.
+    Only works if the link's sharing permissions allow anonymous access."""
+    if "download=1" in share_url:
+        return share_url
+    sep = "&" if "?" in share_url else "?"
+    return f"{share_url}{sep}download=1"
+
+
+@st.cache_data(ttl=1800, show_spinner="Pulling Behavioural Scheduler from SharePoint...")
+def load_behavioural_scheduler(share_url=SHAREPOINT_EXCEL_URL):
+    """Download the shared Behavioural Scheduler workbook and return the
+    'PSF scheduler' and 'DBA' sheets as DataFrames. Returns
+    (psf_df, dba_df, error_message) — error_message is None on success."""
+    download_url = _sharepoint_direct_download_url(share_url)
+    try:
+        resp = requests.get(download_url, timeout=30, allow_redirects=True)
+        resp.raise_for_status()
+        xls = pd.ExcelFile(BytesIO(resp.content))
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), f"Could not download workbook: {e}"
+
+    psf_sheet = next((s for s in xls.sheet_names if "psf" in s.lower()), None)
+    dba_sheet = next((s for s in xls.sheet_names if "dba" in s.lower()), None)
+
+    if psf_sheet is None and dba_sheet is None:
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            f"Neither a 'PSF scheduler' nor a 'DBA' sheet was found. "
+            f"Sheets in the workbook: {', '.join(xls.sheet_names)}",
+        )
+
+    try:
+        psf_df = pd.read_excel(xls, sheet_name=psf_sheet) if psf_sheet else pd.DataFrame()
+        dba_df = pd.read_excel(xls, sheet_name=dba_sheet) if dba_sheet else pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), f"Could not parse workbook sheets: {e}"
+
+    return psf_df, dba_df, None
+
+
+def build_psf_ba_distribution(psf_df, dba_df):
+    """Count Study IDs in the PSF scheduler sheet vs the DBA sheet."""
+
+    def _count_study_ids(df):
+        if df.empty:
+            return 0
+        study_id_col = next(
+            (c for c in df.columns if str(c).strip().lower() in STUDY_ID_COL_CANDIDATES),
+            None,
+        )
+        series = df[study_id_col] if study_id_col else df.iloc[:, 0]
+        return int(series.dropna().nunique())
+
+    return pd.DataFrame(
+        {
+            "Group": ["PSF", "BA"],
+            "Count": [_count_study_ids(psf_df), _count_study_ids(dba_df)],
+        }
+    )
 
 # ───────────────────────────────────────────────────────────────
 # DATA PROCESSING
@@ -273,6 +387,7 @@ def get_upcoming_visits(df_clinical, days_ahead=7):
 
     upcoming = []
     due_cols = {
+        "Day 0": "day_0_due",
         "Week 1": "week_1_due",
         "Week 2": "week_2_due",
         "Week 3": "week_3_due",
@@ -405,14 +520,6 @@ def build_stratification_summary(df_clinical):
 
 def build_stratified_demographics(df_clinical, df_prescreen):
     """Age & sex breakdown for participants who have an assigned stratum.
-
-    Per the SOAR data dictionary, age (prescreen_age) and gender are
-    collected on the pre_screening form, while stratum assignment
-    (ce_assigned_strata) is on the clinical_evaluation form. In a
-    REDCap longitudinal/repeating-instruments export those live on
-    different rows, so this joins the two on record_id. Falls back to
-    looking on df_clinical directly (classic, non-repeating export)
-    if the fields aren't found on df_prescreen.
     """
     if df_clinical.empty or "ce_assigned_strata" not in df_clinical.columns:
         return pd.DataFrame()
@@ -776,6 +883,10 @@ def main():
     weekly_enrollment, cumulative_stratified = build_weekly_enrollment_trends(df_clinical)
     weekly_retention = build_weekly_retention(visit_matrix)
 
+    # ── Behavioural Scheduler (PSF vs BA), pulled from SharePoint ──
+    psf_df, dba_df, scheduler_error = load_behavioural_scheduler()
+    psf_ba_distribution = build_psf_ba_distribution(psf_df, dba_df)
+
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
     # ═══════════════════════════════════════════════════════════
@@ -825,9 +936,7 @@ def main():
                 ],
             }
         )
-        funnel_colors = px.colors.sample_colorscale(
-            "Viridis", [i / (len(funnel_data) - 1) for i in range(len(funnel_data))]
-        )
+        funnel_colors = funnel_palette(len(funnel_data))
         fig_funnel = go.Figure(
             go.Funnel(
                 y=funnel_data["Stage"],
@@ -839,6 +948,39 @@ def main():
         )
         fig_funnel.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=400)
         st.plotly_chart(fig_funnel, use_container_width=True)
+
+        st.markdown("---")
+
+        st.subheader("Behavioural Scheduler: PSF vs BA Distribution")
+        if scheduler_error:
+            st.warning(f"Could not load the Behavioural Scheduler workbook: {scheduler_error}")
+        else:
+            sched_col1, sched_col2 = st.columns([1, 1])
+            with sched_col1:
+                fig_psf_ba = px.bar(
+                    psf_ba_distribution,
+                    x="Group",
+                    y="Count",
+                    text="Count",
+                    color="Group",
+                    color_discrete_sequence=rocket_colors(len(psf_ba_distribution)),
+                    height=320,
+                )
+                fig_psf_ba.update_traces(textposition="outside")
+                fig_psf_ba.update_layout(
+                    showlegend=False,
+                    margin=dict(l=20, r=20, t=20, b=20),
+                    title_font=dict(size=18, color="#4a90d9"),
+                )
+                st.plotly_chart(fig_psf_ba, use_container_width=True)
+            with sched_col2:
+                st.dataframe(
+                    psf_ba_distribution, use_container_width=True, hide_index=True
+                )
+                st.caption(
+                    "Count = distinct Study IDs in the 'PSF scheduler' sheet "
+                    "vs the 'DBA' sheet of the shared Behavioural Scheduler workbook."
+                )
 
         st.markdown("---")
 
@@ -860,7 +1002,7 @@ def main():
                     height=280,
                 )
                 fig_strata.update_traces(
-                    marker_color=viridis_colors(len(strata_summary)),
+                    marker_color=rocket_colors(len(strata_summary)),
                     textposition="outside",
                 )
                 fig_strata.update_layout(
@@ -926,12 +1068,13 @@ def main():
                             height=380,
                         )
                         fig_age.update_traces(
-                            marker_color=viridis_colors(len(age_summary)),
+                            marker_color=rocket_colors(len(age_summary)),
                             textposition="outside",
                         )
                         fig_age.update_layout(
                             showlegend=False,
                             margin=dict(l=20, r=20, t=60, b=20),
+                            title_font=dict(size=18, color="#4a90d9"),
                         )
                         st.plotly_chart(fig_age, use_container_width=True)
                         st.caption(
@@ -963,7 +1106,7 @@ def main():
                         height=380,
                     )
                     fig_sex.update_traces(
-                        marker=dict(colors=viridis_colors(len(sex_counts))),
+                        marker=dict(colors=rocket_colors(len(sex_counts))),
                         text=sex_counts["Label"],
                         textinfo="text",
                         textposition="outside",
@@ -971,6 +1114,7 @@ def main():
                     fig_sex.update_layout(
                         margin=dict(l=20, r=20, t=60, b=20),
                         legend_title_text="Gender",
+                        title_font=dict(size=18, color="#4a90d9"),
                     )
                     st.plotly_chart(fig_sex, use_container_width=True)
                 else:
@@ -988,7 +1132,7 @@ def main():
         with trend_col1:
             st.subheader("Cumulative Stratified Enrollment (by Week)")
             if not cumulative_stratified.empty:
-                trend_color = viridis_colors(3)[1]
+                trend_color = rocket_colors(3)[1]
                 fig_cum = px.line(
                     cumulative_stratified,
                     x="Week",
@@ -1018,8 +1162,17 @@ def main():
                     height=340,
                 )
                 fig_weekly.update_traces(
-                    marker_color=viridis_colors(len(weekly_enrollment)),
+                    marker_color=rocket_colors(len(weekly_enrollment)),
                     textposition="outside",
+                )
+                fig_weekly.add_hline(
+                    y=4,
+                    line_dash="dash",
+                    line_width=2,
+                    line_color="#e63946",
+                    annotation_text="Target: 4/week",
+                    annotation_position="top left",
+                    annotation_font_color="#e63946",
                 )
                 fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
                 st.plotly_chart(fig_weekly, use_container_width=True)
