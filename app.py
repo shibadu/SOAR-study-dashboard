@@ -977,7 +977,7 @@ def main():
                 )
                 st.caption(
                     "Count and % of participants by Behavioral Intervention "
-                    "Assigned (PSF vs BA), from the behavioral_tracking form."
+                    "Assigned (PSF vs BA)"
                 )
 
         st.markdown("---")
