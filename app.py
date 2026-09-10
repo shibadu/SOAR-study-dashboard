@@ -838,7 +838,7 @@ def main():
         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
         kpi1.metric("Pre-Screened", enrollment["total_screened"])
         kpi2.metric(
-            "Eligible & Referred",
+            "Met preliminary eligibility criteria",
             enrollment["eligible_referred"],
             f"{enrollment['eligible_referred'] / max(enrollment['total_screened'], 1) * 100:.0f}%",
         )
@@ -857,7 +857,7 @@ def main():
             {
                 "Stage": [
                     "Pre-Screened",
-                    "Eligible & Referred",
+                    "Met preliminary eligibility criteria",
                     "Consented",
                     "Eligible",
                     "Randomised",
