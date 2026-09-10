@@ -176,42 +176,107 @@ def load_data(_proj):
         return pd.DataFrame()
 
 
-def build_psf_ba_distribution(df_all):
-    """Count + percentage of participants assigned to PSF vs BA, from the
-    Behavioral Intervention Assigned field (bt_intervention_type): 1 = PSF,
-    2 = BA. Looks across the full export (not just the clinical_eval rows)
-    and dedupes by record_id, since this field lives on the separate
-    'behavioral_tracking' form/instrument and may land on its own row
-    (e.g. if that instrument repeats or is tied to a different event)."""
-    empty = pd.DataFrame(columns=["Group", "Count", "Percent"])
-    if df_all.empty:
-        return empty, None
+@st.cache_data(ttl=1800, show_spinner="Pulling behavioral intervention assignments...")
+def load_behavioral_tracking(_proj):
+    """Export the behavioral_tracking form directly.
 
-    if BEHAVIORAL_INTERVENTION_FIELD not in df_all.columns:
-        return (
-            empty,
-            f"Field '{BEHAVIORAL_INTERVENTION_FIELD}' was not returned by the REDCap "
-            "export at all — check that the API token/user has export rights to the "
-            "'Behavioral Tracking' instrument.",
+    The intervention field is on the separate `behavioral_tracking` instrument.
+    A project-wide export can omit a form/field when the API user's export
+    permissions do not include it, so do not depend on the main export
+    containing `bt_intervention_type`.
+    """
+    if _proj is None:
+        return pd.DataFrame(), "REDCap connection is not available."
+
+    field = BEHAVIORAL_INTERVENTION_FIELD
+
+    # Preferred: explicitly request the form and field.
+    try:
+        records = _proj.export_records(
+            fields=["record_id", field],
+            forms=["behavioral_tracking"],
+            raw_or_label="raw",
         )
+        if isinstance(records, pd.DataFrame):
+            df = records.reset_index()
+        else:
+            df = pd.DataFrame(records)
 
-    id_col = "record_id" if "record_id" in df_all.columns else df_all.columns[0]
+        if field in df.columns:
+            return df, None
+    except Exception as e:
+        first_error = str(e)
+    else:
+        first_error = "The requested field was not returned."
 
-    values = df_all[[id_col, BEHAVIORAL_INTERVENTION_FIELD]].copy()
-    values[BEHAVIORAL_INTERVENTION_FIELD] = (
-        values[BEHAVIORAL_INTERVENTION_FIELD].astype(str).str.strip().str.upper()
+    # Fallback: request the field directly without restricting by form.
+    try:
+        records = _proj.export_records(
+            fields=["record_id", field],
+            raw_or_label="raw",
+        )
+        if isinstance(records, pd.DataFrame):
+            df = records.reset_index()
+        else:
+            df = pd.DataFrame(records)
+
+        if field in df.columns:
+            return df, None
+    except Exception as e:
+        second_error = str(e)
+    else:
+        second_error = "The field was not returned."
+
+    return (
+        pd.DataFrame(),
+        f"REDCap did not return '{field}' from the Behavioral Tracking form. "
+        "The data dictionary confirms this field belongs to the "
+        "'behavioral_tracking' instrument and is coded 1=PSF, 2=BA. "
+        "Check the API token/user's Data Export rights for that instrument. "
+        f"API details: {first_error}; fallback: {second_error}.",
     )
-    values["Label"] = values[BEHAVIORAL_INTERVENTION_FIELD].map(BEHAVIORAL_INTERVENTION_MAP)
+
+
+def build_psf_ba_distribution(df_behavioral):
+    """Count + percentage of participants assigned to PSF vs BA.
+
+    Source: behavioral_tracking.bt_intervention_type
+    REDCap coding: 1 = PSF, 2 = BA.
+    """
+    empty = pd.DataFrame(columns=["Group", "Count", "Percent"])
+    if df_behavioral.empty:
+        return empty, "No Behavioral Tracking records were returned."
+
+    field = BEHAVIORAL_INTERVENTION_FIELD
+    if field not in df_behavioral.columns:
+        return empty, f"Field '{field}' was not returned by the Behavioral Tracking export."
+
+    id_col = "record_id" if "record_id" in df_behavioral.columns else df_behavioral.columns[0]
+
+    values = df_behavioral[[id_col, field]].copy()
+
+    # Normalize both raw REDCap codes (1/2) and labels (PSF/BA).
+    values[field] = values[field].astype(str).str.strip().str.upper()
+    values["Label"] = values[field].map(BEHAVIORAL_INTERVENTION_MAP)
     values = values.dropna(subset=["Label"])
-    # One row per participant, in case the field appears on more than one row
-    # (repeating instrument, multiple events, etc.)
-    values = values.drop_duplicates(subset=[id_col])
+
+    # If the behavioral_tracking form is repeated, retain one assignment per participant.
+    values = values.drop_duplicates(subset=[id_col], keep="first")
 
     if values.empty:
-        return empty, f"Field '{BEHAVIORAL_INTERVENTION_FIELD}' was found but has no PSF/BA values yet."
+        return (
+            empty,
+            f"Field '{field}' was returned but contains no valid PSF/BA values yet.",
+        )
 
-    counts = values["Label"].value_counts().reindex(["PSF", "BA"]).fillna(0).astype(int)
+    counts = (
+        values["Label"]
+        .value_counts()
+        .reindex(["PSF", "BA"], fill_value=0)
+        .astype(int)
+    )
     total = int(counts.sum())
+
     dist = pd.DataFrame(
         {
             "Group": counts.index,
@@ -805,8 +870,15 @@ def main():
     weekly_enrollment, cumulative_stratified = build_weekly_enrollment_trends(df_clinical)
     weekly_retention = build_weekly_retention(visit_matrix)
 
-    # ── Behavioral Intervention Assigned (PSF vs BA), from clinical_eval ──
-    psf_ba_distribution, scheduler_error = build_psf_ba_distribution(df_all)
+    # ── Behavioral Intervention Assigned (PSF vs BA) ──
+    # bt_intervention_type is on the separate behavioral_tracking instrument,
+    # so pull that form directly instead of relying on the project-wide export.
+    df_behavioral, behavioral_export_error = load_behavioral_tracking(proj)
+    psf_ba_distribution, scheduler_error = build_psf_ba_distribution(df_behavioral)
+
+    # Prefer the specific behavioral-export error because it is more actionable.
+    if behavioral_export_error and psf_ba_distribution.empty:
+        scheduler_error = behavioral_export_error
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
@@ -905,7 +977,7 @@ def main():
                 )
                 st.caption(
                     "Count and % of participants by Behavioral Intervention "
-                    "Assigned (PSF vs BA), from the clinical_eval form."
+                    "Assigned (PSF vs BA), from the behavioral_tracking form."
                 )
 
         st.markdown("---")
