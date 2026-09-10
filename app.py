@@ -1044,7 +1044,7 @@ def main():
 
         st.markdown("---")
 
-        st.subheader("Stratified Participant Demographics")
+        st.subheader("Randomized Participant Demographics")
         if not strata_demographics.empty and (
             "Age" in strata_demographics.columns or "Sex" in strata_demographics.columns
         ):
