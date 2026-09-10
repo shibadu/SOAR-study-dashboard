@@ -103,11 +103,15 @@ BEHAVIORAL_INTERVENTION_MAP = {"1": "PSF", "2": "BA", "PSF": "PSF", "BA": "BA"}
 
 # Rocket colorscale stops (seaborn's "rocket" palette, sampled 0→1),
 # used in place of Viridis for all standard bar/line/pie charts.
-ROCKET_COLORSCALE = [
-    "#03051a", "#221331", "#451c47", "#691f55", "#921c5b", "#b91657",
-    "#d92847", "#ed503e", "#f47d57", "#f6a47c", "#f7c9aa", "#faebdd",
-]
+#ROCKET_COLORSCALE = [
+#    "#03051a", "#221331", "#451c47", "#691f55", "#921c5b", "#b91657",
+#    "#d92847", "#ed503e", "#f47d57", "#f6a47c", "#f7c9aa", "#faebdd",
+#]
 
+ROCKET_COLORSCALE = [
+    "#9e0142", "#d0384e", "#ee6445", "#fa9b58", "#fece7c", "#fff1a8",
+    "#f4faad", "#d1ed9c", "#97d5a4", "#5cb7aa", "#3682ba", "#5e4fa2",
+]
 # Distinct 5-color palette (grey, blue, purple, orange, green) used only
 # for the Enrollment Funnel, which keeps its own scheme apart from Rocket.
 FUNNEL_COLORS = ["#6c757d", "#2980b9", "#8e44ad", "#e67e22", "#27ae60"]
