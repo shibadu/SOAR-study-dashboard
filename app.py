@@ -174,24 +174,41 @@ def load_data(_proj):
         return pd.DataFrame()
 
 
-def build_psf_ba_distribution(df_clinical):
+def build_psf_ba_distribution(df_all):
     """Count + percentage of participants assigned to PSF vs BA, from the
-    Behavioral Intervention Assigned field (bt_intervention_type) on the
-    clinical_eval form: 1 = PSF, 2 = BA."""
+    Behavioral Intervention Assigned field (bt_intervention_type): 1 = PSF,
+    2 = BA. Looks across the full export (not just the clinical_eval rows)
+    and dedupes by record_id, since this field lives on the separate
+    'behavioral_tracking' form/instrument and may land on its own row
+    (e.g. if that instrument repeats or is tied to a different event)."""
     empty = pd.DataFrame(columns=["Group", "Count", "Percent"])
-    if df_clinical.empty:
+    if df_all.empty:
         return empty, None
 
-    if BEHAVIORAL_INTERVENTION_FIELD not in df_clinical.columns:
-        return empty, f"Field '{BEHAVIORAL_INTERVENTION_FIELD}' not found in the clinical_eval data."
+    if BEHAVIORAL_INTERVENTION_FIELD not in df_all.columns:
+        return (
+            empty,
+            f"Field '{BEHAVIORAL_INTERVENTION_FIELD}' was not returned by the REDCap "
+            "export at all — check that the API token/user has export rights to the "
+            "'Behavioral Tracking' instrument.",
+        )
 
-    values = df_clinical[BEHAVIORAL_INTERVENTION_FIELD].astype(str).str.strip()
-    labels = values.map(BEHAVIORAL_INTERVENTION_MAP)
-    labels = labels.dropna()
-    if labels.empty:
+    id_col = "record_id" if "record_id" in df_all.columns else df_all.columns[0]
+
+    values = df_all[[id_col, BEHAVIORAL_INTERVENTION_FIELD]].copy()
+    values[BEHAVIORAL_INTERVENTION_FIELD] = (
+        values[BEHAVIORAL_INTERVENTION_FIELD].astype(str).str.strip()
+    )
+    values["Label"] = values[BEHAVIORAL_INTERVENTION_FIELD].map(BEHAVIORAL_INTERVENTION_MAP)
+    values = values.dropna(subset=["Label"])
+    # One row per participant, in case the field appears on more than one row
+    # (repeating instrument, multiple events, etc.)
+    values = values.drop_duplicates(subset=[id_col])
+
+    if values.empty:
         return empty, f"Field '{BEHAVIORAL_INTERVENTION_FIELD}' was found but has no PSF/BA values yet."
 
-    counts = labels.value_counts().reindex(["PSF", "BA"]).fillna(0).astype(int)
+    counts = values["Label"].value_counts().reindex(["PSF", "BA"]).fillna(0).astype(int)
     total = int(counts.sum())
     dist = pd.DataFrame(
         {
@@ -787,7 +804,7 @@ def main():
     weekly_retention = build_weekly_retention(visit_matrix)
 
     # ── Behavioral Intervention Assigned (PSF vs BA), from clinical_eval ──
-    psf_ba_distribution, scheduler_error = build_psf_ba_distribution(df_clinical)
+    psf_ba_distribution, scheduler_error = build_psf_ba_distribution(df_all)
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
