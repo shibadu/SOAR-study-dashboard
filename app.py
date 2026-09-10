@@ -1134,9 +1134,9 @@ def main():
                 fig_cum = px.line(
                     cumulative_stratified,
                     x="Week",
-                    y="Cumulative Enrolled",
+                    y="Cumulative Stratified",
                     markers=True,
-                    text="Cumulative Enrolled",
+                    text="Cumulative",
                     height=340,
                 )
                 fig_cum.update_traces(
