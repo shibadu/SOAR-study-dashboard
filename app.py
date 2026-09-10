@@ -692,7 +692,7 @@ def build_weekly_enrollment_trends(df_clinical):
                 stratified.groupby("week").size().reset_index(name="Count")
                 .sort_values("week")
             )
-            weekly_counts["Cumulative Stratified"] = weekly_counts["Count"].cumsum()
+            weekly_counts["Cumulative Enrolled"] = weekly_counts["Count"].cumsum()
             weekly_counts["Week"] = weekly_counts["week"].dt.strftime("%Y-%m-%d")
             cumulative_stratified = weekly_counts
 
@@ -1128,15 +1128,15 @@ def main():
         trend_col1, trend_col2 = st.columns(2)
 
         with trend_col1:
-            st.subheader("Cumulative Stratified Enrollment (by Week)")
+            st.subheader("Cumulative Enrollments (by Week)")
             if not cumulative_stratified.empty:
                 trend_color = rocket_colors(3)[1]
                 fig_cum = px.line(
                     cumulative_stratified,
                     x="Week",
-                    y="Cumulative Stratified",
+                    y="Cumulative Enrolled",
                     markers=True,
-                    text="Cumulative Stratified",
+                    text="Cumulative Enrolled",
                     height=340,
                 )
                 fig_cum.update_traces(
