@@ -94,9 +94,11 @@ AGE_GROUP_LABELS = ["18-30", "31-40", "41-50", "51-60", "60+"]
 AGE_GROUP_BINS = [17, 30, 40, 50, 60, float("inf")]
 
 # Behavioral Intervention Assigned field, from the clinical_eval (CE) form.
-# Raw REDCap field: bt_intervention_type, coded 1 = PSF, 2 = BA.
+# Raw REDCap field: bt_intervention_type, coded 1 = PSF, 2 = BA. Mapped
+# case-insensitively so it also matches if the export ever returns the
+# label text ("PSF"/"BA") directly instead of the numeric code.
 BEHAVIORAL_INTERVENTION_FIELD = "bt_intervention_type"
-BEHAVIORAL_INTERVENTION_MAP = {"1": "PSF", "2": "BA"}
+BEHAVIORAL_INTERVENTION_MAP = {"1": "PSF", "2": "BA", "PSF": "PSF", "BA": "BA"}
 
 
 # Rocket colorscale stops (seaborn's "rocket" palette, sampled 0→1),
@@ -159,9 +161,23 @@ def connect_redcap():
 
 @st.cache_data(ttl=1800, show_spinner="Pulling data from REDCap...")
 def load_data(_proj):
-    """Export all records from REDCap. Returns empty DataFrame on failure."""
+    """Export all records from REDCap. Returns empty DataFrame on failure.
+
+    Uses format_type="df", which PyCap builds from REDCap's CSV export.
+    The CSV export always includes every field defined in the project
+    (per the data dictionary) as a column, even for sparsely-populated
+    instruments — unlike the JSON export path, where a field can end up
+    missing as a DataFrame column if pandas doesn't happen to see that key
+    in the returned records. Falls back to the JSON path if the df export
+    isn't available for some reason (e.g. an older PyCap version)."""
     if _proj is None:
         return pd.DataFrame()
+
+    try:
+        df = _proj.export_records(format_type="df")
+        return df
+    except Exception:
+        pass
 
     try:
         # PyCap 3.x returns a list of dicts; older versions may return a DataFrame
@@ -197,7 +213,7 @@ def build_psf_ba_distribution(df_all):
 
     values = df_all[[id_col, BEHAVIORAL_INTERVENTION_FIELD]].copy()
     values[BEHAVIORAL_INTERVENTION_FIELD] = (
-        values[BEHAVIORAL_INTERVENTION_FIELD].astype(str).str.strip()
+        values[BEHAVIORAL_INTERVENTION_FIELD].astype(str).str.strip().str.upper()
     )
     values["Label"] = values[BEHAVIORAL_INTERVENTION_FIELD].map(BEHAVIORAL_INTERVENTION_MAP)
     values = values.dropna(subset=["Label"])
