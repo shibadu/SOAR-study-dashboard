@@ -161,23 +161,9 @@ def connect_redcap():
 
 @st.cache_data(ttl=1800, show_spinner="Pulling data from REDCap...")
 def load_data(_proj):
-    """Export all records from REDCap. Returns empty DataFrame on failure.
-
-    Uses format_type="df", which PyCap builds from REDCap's CSV export.
-    The CSV export always includes every field defined in the project
-    (per the data dictionary) as a column, even for sparsely-populated
-    instruments — unlike the JSON export path, where a field can end up
-    missing as a DataFrame column if pandas doesn't happen to see that key
-    in the returned records. Falls back to the JSON path if the df export
-    isn't available for some reason (e.g. an older PyCap version)."""
+    """Export all records from REDCap. Returns empty DataFrame on failure."""
     if _proj is None:
         return pd.DataFrame()
-
-    try:
-        df = _proj.export_records(format_type="df")
-        return df
-    except Exception:
-        pass
 
     try:
         # PyCap 3.x returns a list of dicts; older versions may return a DataFrame
@@ -838,7 +824,7 @@ def main():
         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
         kpi1.metric("Pre-Screened", enrollment["total_screened"])
         kpi2.metric(
-            "Met preliminary eligibility criteria",
+            "Eligible & Referred",
             enrollment["eligible_referred"],
             f"{enrollment['eligible_referred'] / max(enrollment['total_screened'], 1) * 100:.0f}%",
         )
@@ -857,7 +843,7 @@ def main():
             {
                 "Stage": [
                     "Pre-Screened",
-                    "Met preliminary eligibility criteria",
+                    "Eligible & Referred",
                     "Consented",
                     "Eligible",
                     "Randomised",
