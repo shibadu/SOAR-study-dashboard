@@ -16,11 +16,8 @@ Environment variables:
 """
 
 import os
-import base64
 from datetime import datetime, timedelta
-from io import BytesIO
 
-import requests
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -96,17 +93,10 @@ VISIT_WINDOW_ORDER = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
 AGE_GROUP_LABELS = ["18-30", "31-40", "41-50", "51-60", "60+"]
 AGE_GROUP_BINS = [17, 30, 40, 50, 60, float("inf")]
 
-# Shared "Behavioural Scheduler" workbook on SharePoint (PSF scheduler / DBA
-# sheets). Override via env var if the link ever changes. This link must have
-# "Anyone with the link" view/download sharing enabled — no auth is sent.
-SHAREPOINT_EXCEL_URL = os.getenv(
-    "SHAREPOINT_EXCEL_URL",
-    "https://cihebkenyaorg-my.sharepoint.com/:x:/r/personal/mondire_cihebkenya_org1/"
-    "_layouts/15/Doc.aspx?sourcedoc=%7B86734D1D-0DFF-41A8-9FAA-B1BC239944C2%7D"
-    "&file=Behavioural%20Scheduler%20July%202026%2CMA%2CJO%2CWM.xlsx"
-    "&fromShare=true&action=default&mobileredirect=true",
-)
-STUDY_ID_COL_CANDIDATES = ["study id", "study_id", "studyid"]
+# Behavioral Intervention Assigned field, from the clinical_eval (CE) form.
+# Raw REDCap field: bt_intervention_type, coded 1 = PSF, 2 = BA.
+BEHAVIORAL_INTERVENTION_FIELD = "bt_intervention_type"
+BEHAVIORAL_INTERVENTION_MAP = {"1": "PSF", "2": "BA"}
 
 
 # Rocket colorscale stops (seaborn's "rocket" palette, sampled 0→1),
@@ -184,68 +174,33 @@ def load_data(_proj):
         return pd.DataFrame()
 
 
-def _sharepoint_direct_download_url(share_url):
-    """Turn a SharePoint 'anyone with the link' share URL into a direct
-    download URL by appending download=1 to the Doc.aspx query string.
-    Only works if the link's sharing permissions allow anonymous access."""
-    if "download=1" in share_url:
-        return share_url
-    sep = "&" if "?" in share_url else "?"
-    return f"{share_url}{sep}download=1"
+def build_psf_ba_distribution(df_clinical):
+    """Count + percentage of participants assigned to PSF vs BA, from the
+    Behavioral Intervention Assigned field (bt_intervention_type) on the
+    clinical_eval form: 1 = PSF, 2 = BA."""
+    empty = pd.DataFrame(columns=["Group", "Count", "Percent"])
+    if df_clinical.empty:
+        return empty, None
 
+    if BEHAVIORAL_INTERVENTION_FIELD not in df_clinical.columns:
+        return empty, f"Field '{BEHAVIORAL_INTERVENTION_FIELD}' not found in the clinical_eval data."
 
-@st.cache_data(ttl=1800, show_spinner="Pulling Behavioural Scheduler from SharePoint...")
-def load_behavioural_scheduler(share_url=SHAREPOINT_EXCEL_URL):
-    """Download the shared Behavioural Scheduler workbook and return the
-    'PSF scheduler' and 'DBA' sheets as DataFrames. Returns
-    (psf_df, dba_df, error_message) — error_message is None on success."""
-    download_url = _sharepoint_direct_download_url(share_url)
-    try:
-        resp = requests.get(download_url, timeout=30, allow_redirects=True)
-        resp.raise_for_status()
-        xls = pd.ExcelFile(BytesIO(resp.content))
-    except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), f"Could not download workbook: {e}"
+    values = df_clinical[BEHAVIORAL_INTERVENTION_FIELD].astype(str).str.strip()
+    labels = values.map(BEHAVIORAL_INTERVENTION_MAP)
+    labels = labels.dropna()
+    if labels.empty:
+        return empty, f"Field '{BEHAVIORAL_INTERVENTION_FIELD}' was found but has no PSF/BA values yet."
 
-    psf_sheet = next((s for s in xls.sheet_names if "psf" in s.lower()), None)
-    dba_sheet = next((s for s in xls.sheet_names if "dba" in s.lower()), None)
-
-    if psf_sheet is None and dba_sheet is None:
-        return (
-            pd.DataFrame(),
-            pd.DataFrame(),
-            f"Neither a 'PSF scheduler' nor a 'DBA' sheet was found. "
-            f"Sheets in the workbook: {', '.join(xls.sheet_names)}",
-        )
-
-    try:
-        psf_df = pd.read_excel(xls, sheet_name=psf_sheet) if psf_sheet else pd.DataFrame()
-        dba_df = pd.read_excel(xls, sheet_name=dba_sheet) if dba_sheet else pd.DataFrame()
-    except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), f"Could not parse workbook sheets: {e}"
-
-    return psf_df, dba_df, None
-
-
-def build_psf_ba_distribution(psf_df, dba_df):
-    """Count Study IDs in the PSF scheduler sheet vs the DBA sheet."""
-
-    def _count_study_ids(df):
-        if df.empty:
-            return 0
-        study_id_col = next(
-            (c for c in df.columns if str(c).strip().lower() in STUDY_ID_COL_CANDIDATES),
-            None,
-        )
-        series = df[study_id_col] if study_id_col else df.iloc[:, 0]
-        return int(series.dropna().nunique())
-
-    return pd.DataFrame(
+    counts = labels.value_counts().reindex(["PSF", "BA"]).fillna(0).astype(int)
+    total = int(counts.sum())
+    dist = pd.DataFrame(
         {
-            "Group": ["PSF", "BA"],
-            "Count": [_count_study_ids(psf_df), _count_study_ids(dba_df)],
+            "Group": counts.index,
+            "Count": counts.values,
+            "Percent": (counts.values / total * 100).round(1) if total else 0,
         }
     )
+    return dist, None
 
 # ───────────────────────────────────────────────────────────────
 # DATA PROCESSING
@@ -737,57 +692,6 @@ def generate_shareable_link(view_mode, filters=None):
     query_string = "&".join([f"{k}={v}" for k, v in params.items()])
     return f"{base_url}/?{query_string}"
 
-def create_summary_html(enrollment, visit_matrix, upcoming, overdue, safety=None):
-    """Generate a static HTML summary report for sharing."""
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>SOAR Study Summary Report</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 2rem auto; padding: 1rem; }}
-            h1 {{ color: #1f4e79; border-bottom: 2px solid #1f4e79; padding-bottom: 0.5rem; }}
-            .metric {{ display: inline-block; margin: 1rem; padding: 1rem 2rem; background: #f0f4f8; border-radius: 8px; text-align: center; }}
-            .metric-value {{ font-size: 2rem; font-weight: bold; color: #1f4e79; }}
-            .metric-label {{ font-size: 0.9rem; color: #555; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 1rem; }}
-            th, td {{ padding: 0.6rem; text-align: left; border-bottom: 1px solid #ddd; }}
-            th {{ background: #1f4e79; color: white; }}
-            .alert {{ background: #fff3cd; padding: 1rem; border-radius: 6px; margin-top: 1rem; }}
-            .footer {{ margin-top: 2rem; font-size: 0.8rem; color: #888; text-align: center; }}
-        </style>
-    </head>
-    <body>
-        <h1>SOAR Study Enrollment & Follow-up Summary</h1>
-        <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
-
-        <h2>Enrollment Funnel</h2>
-        <div>
-            <div class="metric"><div class="metric-value">{enrollment.get("total_screened", 0)}</div><div class="metric-label">Pre-Screened</div></div>
-            <div class="metric"><div class="metric-value">{enrollment.get("eligible_referred", 0)}</div><div class="metric-label">Eligible & Referred</div></div>
-            <div class="metric"><div class="metric-value">{enrollment.get("consented", 0)}</div><div class="metric-label">Consented</div></div>
-            <div class="metric"><div class="metric-value">{enrollment.get("clinically_eligible", 0)}</div><div class="metric-label">Clinically Eligible</div></div>
-            <div class="metric"><div class="metric-value">{enrollment.get("stratified", 0)}</div><div class="metric-label">Stratified</div></div>
-        </div>
-
-        <h2>Safety Screening</h2>
-        {f"<p>MINI-S Eligible: {safety.get('mini_eligible', 0)} | Screened Out: {safety.get('mini_screenout', 0)}</p>" if safety else "<p>No safety data available.</p>"}
-        {f"<p>HHDS Eligible: {safety.get('hhds_eligible', 0)} | Screened Out: {safety.get('hhds_screenout', 0)}</p>" if safety else ""}
-
-        <h2>Overdue Visits ({len(overdue)})</h2>
-        {overdue.to_html(index=False) if not overdue.empty else "<p>No overdue visits. Great job!</p>"}
-
-        <h2>Upcoming Visits (Next 7 Days)</h2>
-        {upcoming.to_html(index=False) if not upcoming.empty else "<p>No upcoming visits in the next 7 days.</p>"}
-
-        <div class="footer">
-            Generated by SOAR Study Tracker | REDCap Longitudinal Dashboard
-        </div>
-    </body>
-    </html>
-    """
-    return html
-
 # ───────────────────────────────────────────────────────────────
 # MAIN APP
 # ───────────────────────────────────────────────────────────────
@@ -803,7 +707,6 @@ def main():
                 "Dashboard",
                 "Visit Matrix",
                 "Alerts",
-                "Shareable Summary",
             ],
             index=0,
         )
@@ -883,9 +786,8 @@ def main():
     weekly_enrollment, cumulative_stratified = build_weekly_enrollment_trends(df_clinical)
     weekly_retention = build_weekly_retention(visit_matrix)
 
-    # ── Behavioural Scheduler (PSF vs BA), pulled from SharePoint ──
-    psf_df, dba_df, scheduler_error = load_behavioural_scheduler()
-    psf_ba_distribution = build_psf_ba_distribution(psf_df, dba_df)
+    # ── Behavioral Intervention Assigned (PSF vs BA), from clinical_eval ──
+    psf_ba_distribution, scheduler_error = build_psf_ba_distribution(df_clinical)
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
@@ -912,8 +814,8 @@ def main():
             enrollment["consented"],
             f"{enrollment['consented'] / max(enrollment['eligible_referred'], 1) * 100:.0f}%",
         )
-        kpi4.metric("Clinically Eligible", enrollment["clinically_eligible"])
-        kpi5.metric("Stratified", enrollment["stratified"])
+        kpi4.metric("Eligible", enrollment["clinically_eligible"])
+        kpi5.metric("Randomised", enrollment["stratified"])
 
         st.markdown("---")
 
@@ -924,8 +826,8 @@ def main():
                     "Pre-Screened",
                     "Eligible & Referred",
                     "Consented",
-                    "Clinically Eligible",
-                    "Stratified",
+                    "Eligible",
+                    "Randomised",
                 ],
                 "Count": [
                     enrollment["total_screened"],
@@ -951,24 +853,29 @@ def main():
 
         st.markdown("---")
 
-        st.subheader("Behavioural Scheduler: PSF vs BA Distribution")
+        st.subheader("Behavioral Intervention Assigned: PSF vs BA")
         if scheduler_error:
-            st.warning(f"Could not load the Behavioural Scheduler workbook: {scheduler_error}")
+            st.warning(scheduler_error)
         else:
             sched_col1, sched_col2 = st.columns([1, 1])
             with sched_col1:
-                fig_psf_ba = px.bar(
+                fig_psf_ba = px.pie(
                     psf_ba_distribution,
-                    x="Group",
-                    y="Count",
-                    text="Count",
-                    color="Group",
-                    color_discrete_sequence=rocket_colors(len(psf_ba_distribution)),
+                    names="Group",
+                    values="Count",
                     height=320,
+                    color_discrete_sequence=rocket_colors(len(psf_ba_distribution)),
                 )
-                fig_psf_ba.update_traces(textposition="outside")
+                fig_psf_ba.update_traces(
+                    text=psf_ba_distribution.apply(
+                        lambda r: f"{r['Group']}: {int(r['Count'])} ({r['Percent']:.0f}%)",
+                        axis=1,
+                    ),
+                    textinfo="text",
+                    textposition="outside",
+                )
                 fig_psf_ba.update_layout(
-                    showlegend=False,
+                    showlegend=True,
                     margin=dict(l=20, r=20, t=20, b=20),
                     title_font=dict(size=18, color="#4a90d9"),
                 )
@@ -978,8 +885,8 @@ def main():
                     psf_ba_distribution, use_container_width=True, hide_index=True
                 )
                 st.caption(
-                    "Count = distinct Study IDs in the 'PSF scheduler' sheet "
-                    "vs the 'DBA' sheet of the shared Behavioural Scheduler workbook."
+                    "Count and % of participants by Behavioral Intervention "
+                    "Assigned (PSF vs BA), from the clinical_eval form."
                 )
 
         st.markdown("---")
@@ -1306,54 +1213,6 @@ def main():
                     st.success("No protocol deviations recorded.")
             else:
                 st.info("No protocol deviation data available.")
-
-    # ═══════════════════════════════════════════════════════════
-    # VIEW: SHAREABLE SUMMARY
-    # ═══════════════════════════════════════════════════════════
-    elif view_mode == "Shareable Summary":
-        st.markdown(
-            '<div class="main-header">Shareable Summary</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            "Download a static HTML report."
-        )
-
-        st.markdown("---")
-
-        st.subheader("Download Static HTML Report")
-        st.markdown(
-            "Generate a self-contained HTML file that can be emailed or shared offline."
-        )
-
-        if st.button("Generate HTML Report"):
-            html_content = create_summary_html(
-                enrollment, visit_matrix, upcoming, overdue, safety
-            )
-
-            b64 = base64.b64encode(html_content.encode()).decode()
-            href = f'<a href="data:text/html;base64,{b64}" download="soar_study_summary_{datetime.now().strftime("%Y%m%d")}.html">Click here to download HTML report</a>'
-            st.markdown(href, unsafe_allow_html=True)
-            st.success("Report generated! Click the link above to download.")
-
-        st.markdown("---")
-
-        st.subheader("3. Quick Copy-Paste Stats")
-        stats_text = f"""
-SOAR Study Summary - {datetime.now().strftime("%Y-%m-%d")}
-----------------------------------------
-Enrollment:
-  - Pre-Screened:           {enrollment['total_screened']}
-  - Eligible & Referred:    {enrollment['eligible_referred']} ({enrollment['eligible_referred'] / max(enrollment['total_screened'], 1) * 100:.0f}%)
-  - Consented:              {enrollment['consented']} ({enrollment['consented'] / max(enrollment['eligible_referred'], 1) * 100:.0f}%)
-  - Clinically Eligible:    {enrollment['clinically_eligible']}
-  - Stratified:             {enrollment['stratified']}
-
-Alerts:
-  - Overdue visits:         {len(overdue)}
-  - Upcoming (7 days):      {len(upcoming)}
-        """
-        st.text_area("Copy these stats to email/Slack/Teams", stats_text, height=300)
 
 if __name__ == "__main__":
     main()
