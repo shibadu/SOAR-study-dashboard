@@ -1044,7 +1044,7 @@ def main():
 
         st.markdown("---")
 
-        st.subheader("Stratified Participant Demographics")
+        st.subheader("Eligible Participant Demographics")
         if not strata_demographics.empty and (
             "Age" in strata_demographics.columns or "Sex" in strata_demographics.columns
         ):
@@ -1128,15 +1128,15 @@ def main():
         trend_col1, trend_col2 = st.columns(2)
 
         with trend_col1:
-            st.subheader("Cumulative Stratified Enrollment (by Week)")
+            st.subheader("Cumulative Enrollments (by Week)")
             if not cumulative_stratified.empty:
                 trend_color = rocket_colors(3)[1]
                 fig_cum = px.line(
                     cumulative_stratified,
                     x="Week",
-                    y="Cumulative Stratified",
+                    y="Cumulative Enrolled",
                     markers=True,
-                    text="Cumulative Stratified",
+                    text="Cumulative Enrolled",
                     height=340,
                 )
                 fig_cum.update_traces(
