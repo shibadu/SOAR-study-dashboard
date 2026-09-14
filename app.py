@@ -325,7 +325,12 @@ def build_psf_session_summary(df_behavioral):
     df[field] = df[field].astype(str).str.strip().str.upper()
     df["Label"] = df[field].map(BEHAVIORAL_INTERVENTION_MAP)
 
-    # One row per participant; keep only those assigned to PSF.
+    # behavioral_tracking has multiple rows per participant (assignment row
+    # plus session rows), and bt_intervention_type is only populated on some
+    # of them. Drop rows with no valid Label BEFORE deduplicating, or
+    # drop_duplicates can keep a blank row and lose the real assignment —
+    # same ordering as build_psf_ba_distribution, which this must match.
+    df = df.dropna(subset=["Label"])
     df = df.drop_duplicates(subset=[id_col], keep="first")
     psf_df = df[df["Label"] == "PSF"]
 
