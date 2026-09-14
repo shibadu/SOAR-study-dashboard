@@ -100,6 +100,15 @@ AGE_GROUP_BINS = [17, 30, 40, 50, 60, float("inf")]
 BEHAVIORAL_INTERVENTION_FIELD = "bt_intervention_type"
 BEHAVIORAL_INTERVENTION_MAP = {"1": "PSF", "2": "BA", "PSF": "PSF", "BA": "BA"}
 
+# PSF follow-up session completion fields, from the behavioral_tracking form
+# (data dictionary rows bt_psf_s1_status ... bt_psf_s8_status). Each is
+# coded 1 = Done, 0 = Not Done, and only populated when
+# bt_intervention_type = 1 (PSF).
+PSF_SESSION_STATUS_FIELDS = [f"bt_psf_s{i}_status" for i in range(1, 9)]
+PSF_SESSION_STATUS_LABELS = {
+    field: f"Session {i}" for i, field in enumerate(PSF_SESSION_STATUS_FIELDS, start=1)
+}
+
 
 # Rocket colorscale stops (seaborn's "rocket" palette, sampled 0→1),
 # used in place of Viridis for all standard bar/line/pie charts.
@@ -184,20 +193,22 @@ def load_data(_proj):
 def load_behavioral_tracking(_proj):
     """Export the behavioral_tracking form directly.
 
-    The intervention field is on the separate `behavioral_tracking` instrument.
-    A project-wide export can omit a form/field when the API user's export
-    permissions do not include it, so do not depend on the main export
-    containing `bt_intervention_type`.
+    The intervention field and the 8 PSF session status fields all live on
+    the separate `behavioral_tracking` instrument. A project-wide export can
+    omit a form/field when the API user's export permissions do not include
+    it, so do not depend on the main export containing `bt_intervention_type`
+    or the `bt_psf_s#_status` fields.
     """
     if _proj is None:
         return pd.DataFrame(), "REDCap connection is not available."
 
     field = BEHAVIORAL_INTERVENTION_FIELD
+    all_fields = ["record_id", field] + PSF_SESSION_STATUS_FIELDS
 
-    # Preferred: explicitly request the form and field.
+    # Preferred: explicitly request the form and fields.
     try:
         records = _proj.export_records(
-            fields=["record_id", field],
+            fields=all_fields,
             forms=["behavioral_tracking"],
             raw_or_label="raw",
         )
@@ -213,10 +224,10 @@ def load_behavioral_tracking(_proj):
     else:
         first_error = "The requested field was not returned."
 
-    # Fallback: request the field directly without restricting by form.
+    # Fallback: request the fields directly without restricting by form.
     try:
         records = _proj.export_records(
-            fields=["record_id", field],
+            fields=all_fields,
             raw_or_label="raw",
         )
         if isinstance(records, pd.DataFrame):
@@ -289,6 +300,73 @@ def build_psf_ba_distribution(df_behavioral):
         }
     )
     return dist, None
+
+
+def build_psf_session_summary(df_behavioral):
+    """n (%) of PSF-assigned participants who completed each of the 8
+    follow-up sessions.
+
+    Source: behavioral_tracking.bt_psf_s1_status ... bt_psf_s8_status.
+    REDCap coding: 1 = Done, 0 = Not Done. Denominator (N) is the total
+    number of participants assigned to PSF, since only PSF participants
+    have these fields populated.
+    """
+    empty = pd.DataFrame(columns=["Session", "Done", "Total", "Percent"])
+    if df_behavioral.empty:
+        return empty, 0, "No Behavioral Tracking records were returned."
+
+    field = BEHAVIORAL_INTERVENTION_FIELD
+    if field not in df_behavioral.columns:
+        return empty, 0, f"Field '{field}' was not returned by the Behavioral Tracking export."
+
+    id_col = "record_id" if "record_id" in df_behavioral.columns else df_behavioral.columns[0]
+
+    df = df_behavioral.copy()
+    df[field] = df[field].astype(str).str.strip().str.upper()
+    df["Label"] = df[field].map(BEHAVIORAL_INTERVENTION_MAP)
+
+    # One row per participant; keep only those assigned to PSF.
+    df = df.drop_duplicates(subset=[id_col], keep="first")
+    psf_df = df[df["Label"] == "PSF"]
+
+    total_psf = int(len(psf_df))
+    if total_psf == 0:
+        return empty, 0, "No participants have been assigned to PSF yet."
+
+    missing_fields = [f for f in PSF_SESSION_STATUS_FIELDS if f not in psf_df.columns]
+    if len(missing_fields) == len(PSF_SESSION_STATUS_FIELDS):
+        return (
+            empty,
+            total_psf,
+            "None of the PSF session status fields (bt_psf_s1_status ... "
+            "bt_psf_s8_status) were returned by the export.",
+        )
+
+    rows = []
+    for i, sess_field in enumerate(PSF_SESSION_STATUS_FIELDS, start=1):
+        if sess_field in psf_df.columns:
+            vals = psf_df[sess_field].astype(str).str.strip()
+            done = int((vals == "1").sum())
+        else:
+            done = 0
+        rows.append(
+            {
+                "Session": f"Session {i}",
+                "Done": done,
+                "Total": total_psf,
+                "Percent": round(done / total_psf * 100, 1) if total_psf else 0,
+            }
+        )
+
+    summary = pd.DataFrame(rows)
+    warning = None
+    if missing_fields:
+        warning = (
+            f"{len(missing_fields)} of 8 session status fields were not "
+            "returned by the export and are shown as 0 done: "
+            + ", ".join(missing_fields)
+        )
+    return summary, total_psf, warning
 
 # ───────────────────────────────────────────────────────────────
 # DATA PROCESSING
@@ -879,10 +957,15 @@ def main():
     # so pull that form directly instead of relying on the project-wide export.
     df_behavioral, behavioral_export_error = load_behavioral_tracking(proj)
     psf_ba_distribution, scheduler_error = build_psf_ba_distribution(df_behavioral)
+    psf_session_summary, total_psf_assigned, psf_session_warning = build_psf_session_summary(
+        df_behavioral
+    )
 
     # Prefer the specific behavioral-export error because it is more actionable.
     if behavioral_export_error and psf_ba_distribution.empty:
         scheduler_error = behavioral_export_error
+    if behavioral_export_error and psf_session_summary.empty:
+        psf_session_warning = behavioral_export_error
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
@@ -952,12 +1035,14 @@ def main():
         if scheduler_error:
             st.warning(scheduler_error)
         else:
+            total_assigned = int(psf_ba_distribution["Count"].sum())
             sched_col1, sched_col2 = st.columns([1, 1])
             with sched_col1:
                 fig_psf_ba = px.pie(
                     psf_ba_distribution,
                     names="Group",
                     values="Count",
+                    title=f"Number Assigned (N={total_assigned})",
                     height=320,
                     color_discrete_sequence=rocket_colors(len(psf_ba_distribution)),
                 )
@@ -1263,6 +1348,46 @@ def main():
                 )
             else:
                 st.info("Not enough visit outcome data to compute retention yet.")
+
+            st.markdown("---")
+
+            st.subheader("PSF Session Completion")
+            if psf_session_warning:
+                st.warning(psf_session_warning)
+            if not psf_session_summary.empty:
+                st.markdown(f"**Total PSF Assigned: {total_psf_assigned}**")
+                fig_psf_sessions = px.bar(
+                    psf_session_summary,
+                    x="Session",
+                    y="Done",
+                    text=psf_session_summary.apply(
+                        lambda r: f"{int(r['Done'])} ({r['Percent']:.0f}%)", axis=1
+                    ),
+                    labels={"Done": "Participants (n)"},
+                    height=380,
+                )
+                fig_psf_sessions.update_traces(
+                    marker_color=rocket_colors(len(psf_session_summary)),
+                    textposition="outside",
+                )
+                fig_psf_sessions.update_layout(
+                    yaxis=dict(range=[0, total_psf_assigned * 1.15 if total_psf_assigned else 1]),
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    title=f"PSF Sessions Completed (N={total_psf_assigned})",
+                    title_font=dict(size=18, color="#4a90d9"),
+                )
+                st.plotly_chart(fig_psf_sessions, use_container_width=True)
+                st.dataframe(
+                    psf_session_summary.assign(
+                        **{"n (%)": psf_session_summary.apply(
+                            lambda r: f"{int(r['Done'])} ({r['Percent']:.0f}%)", axis=1
+                        )}
+                    )[["Session", "n (%)", "Total"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            elif not psf_session_warning:
+                st.info("No PSF session data available yet.")
         else:
             st.info("No visit data to display.")
 
