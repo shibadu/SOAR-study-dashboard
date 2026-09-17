@@ -1449,11 +1449,11 @@ def main():
                     barmode="stack",
                     height=380,
                     margin=dict(l=20, r=20, t=30, b=20),
-                    title=f"PSF Sessions Completed (N={total_psf_assigned})",
+                    title=f"Total Participants on PSF (N={total_psf_assigned})",
                     title_font=dict(size=18, color="#4a90d9"),
                     xaxis=dict(title="% of PSF", range=[0, 100], ticksuffix="%"),
                     yaxis=dict(title=""),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=0.80, xanchor="left", x=0),
                 )
                 st.plotly_chart(fig_psf_sessions, use_container_width=True)
                 st.dataframe(
