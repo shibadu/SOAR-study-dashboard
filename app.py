@@ -68,6 +68,13 @@ st.markdown("""
     [data-testid="stToolbar"] { visibility: hidden !important; height: 0 !important; }
     #MainMenu { visibility: hidden !important; }
     [class*="viewerBadge"] { display: none !important; }
+
+    /* Hide the "Made with Streamlit" / GitHub footer badges at the bottom of the page */
+    footer { visibility: hidden !important; height: 0 !important; }
+    [data-testid="stFooter"] { visibility: hidden !important; height: 0 !important; }
+    a[href*="github.com"][class*="viewerBadge"],
+    .viewerBadge_link__qRIco,
+    .viewerBadge_container__1QSob { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -89,6 +96,11 @@ SEX_FIELD_CANDIDATES = ["gender", "sex", "participant_sex"]
 SEX_MAP = {"1": "Male", "2": "Female"}
 
 VISIT_WINDOW_ORDER = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
+
+# Target rate of stratified (randomized) enrollment, used both for the
+# "Enrollments by Week" reference line and the "Cumulative Enrollments"
+# target line.
+WEEKLY_ENROLLMENT_TARGET = 4
 
 AGE_GROUP_LABELS = ["18-30", "31-40", "41-50", "51-60", "60+"]
 AGE_GROUP_BINS = [17, 30, 40, 50, 60, float("inf")]
@@ -780,6 +792,14 @@ def build_weekly_enrollment_trends(df_clinical):
                 .sort_values("week")
             )
             weekly_counts["Cumulative Enrolled"] = weekly_counts["Count"].cumsum()
+
+            # Cumulative Target grows by WEEKLY_ENROLLMENT_TARGET for every
+            # calendar week elapsed since the first stratified enrollment,
+            # so gaps with zero enrollments still count against the target.
+            first_week = weekly_counts["week"].min()
+            weeks_elapsed = ((weekly_counts["week"] - first_week).dt.days // 7) + 1
+            weekly_counts["Cumulative Target"] = weeks_elapsed * WEEKLY_ENROLLMENT_TARGET
+
             weekly_counts["Week"] = weekly_counts["week"].dt.strftime("%Y-%m-%d")
             cumulative_stratified = weekly_counts
 
@@ -1076,14 +1096,16 @@ def main():
 
         st.markdown("---")
 
-        col_left, col_right = st.columns([1, 1])
+        st.subheader("Stratification Summary")
+        if not strata_summary.empty:
+            strata_col_left, strata_col_right = st.columns([1, 1])
 
-        with col_left:
-            st.subheader("Stratification Summary")
-            if not strata_summary.empty:
+            with strata_col_left:
                 st.dataframe(
                     strata_summary, use_container_width=True, hide_index=True
                 )
+
+            with strata_col_right:
                 fig_strata = px.bar(
                     strata_summary,
                     x="Count",
@@ -1103,38 +1125,39 @@ def main():
                     yaxis=dict(categoryorder="total ascending"),
                 )
                 st.plotly_chart(fig_strata, use_container_width=True)
-            else:
-                st.info("No stratification data available yet.")
+        else:
+            st.info("No stratification data available yet.")
 
-        with col_right:
-            st.subheader("Visit Adherence Overview")
-            if not visit_matrix.empty:
-                status_counts = (
-                    visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
-                )
-                for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]:
-                    if status not in status_counts.index:
-                        status_counts.loc[status] = 0
+        st.markdown("---")
 
-                fig_adherence = px.bar(
-                    status_counts.T,
-                    barmode="stack",
-                    color_discrete_map={
-                        "Completed": "#2e7d32",
-                        "Pending": "#ffc107",
-                        "Missed": "#dc3545",
-                        "Rescheduled": "#17a2b8",
-                        "Early Term": "#6c757d",
-                    },
-                    labels={"value": "Participants", "index": "Visit Window"},
-                    height=400,
-                )
-                fig_adherence.update_layout(
-                    margin=dict(l=20, r=20, t=30, b=20)
-                )
-                st.plotly_chart(fig_adherence, use_container_width=True)
-            else:
-                st.info("No visit data available yet.")
+        st.subheader("Visit Adherence Overview")
+        if not visit_matrix.empty:
+            status_counts = (
+                visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
+            )
+            for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]:
+                if status not in status_counts.index:
+                    status_counts.loc[status] = 0
+
+            fig_adherence = px.bar(
+                status_counts.T,
+                barmode="stack",
+                color_discrete_map={
+                    "Completed": "#2e7d32",
+                    "Pending": "#ffc107",
+                    "Missed": "#dc3545",
+                    "Rescheduled": "#17a2b8",
+                    "Early Term": "#6c757d",
+                },
+                labels={"value": "Participants", "index": "Visit Window"},
+                height=400,
+            )
+            fig_adherence.update_layout(
+                margin=dict(l=20, r=20, t=30, b=20)
+            )
+            st.plotly_chart(fig_adherence, use_container_width=True)
+        else:
+            st.info("No visit data available yet.")
 
         st.markdown("---")
 
@@ -1219,57 +1242,81 @@ def main():
 
         st.markdown("---")
 
-        trend_col1, trend_col2 = st.columns(2)
+        st.subheader("Cumulative Enrollments (by Week)")
+        if not cumulative_stratified.empty:
+            achieved_color = rocket_colors(3)[1]
+            target_color = "#e63946"
 
-        with trend_col1:
-            st.subheader("Cumulative Enrollments (by Week)")
-            if not cumulative_stratified.empty:
-                trend_color = rocket_colors(3)[1]
-                fig_cum = px.line(
-                    cumulative_stratified,
-                    x="Week",
-                    y="Cumulative Enrolled",
-                    markers=True,
-                    text="Cumulative Enrolled",
-                    height=340,
-                )
-                fig_cum.update_traces(
-                    textposition="top center",
-                    line_color=trend_color,
-                    marker=dict(color=trend_color, size=8),
-                )
-                fig_cum.update_layout(margin=dict(l=20, r=20, t=30, b=20))
-                st.plotly_chart(fig_cum, use_container_width=True)
-            else:
-                st.info("No stratification date data available yet.")
+            fig_cum = go.Figure()
+            fig_cum.add_trace(go.Scatter(
+                x=cumulative_stratified["Week"],
+                y=cumulative_stratified["Cumulative Enrolled"],
+                mode="lines+markers+text",
+                name="Cumulative Achieved",
+                text=cumulative_stratified["Cumulative Enrolled"],
+                textposition="top center",
+                line=dict(color=achieved_color, width=3),
+                marker=dict(color=achieved_color, size=8),
+            ))
+            fig_cum.add_trace(go.Scatter(
+                x=cumulative_stratified["Week"],
+                y=cumulative_stratified["Cumulative Target"],
+                mode="lines",
+                name="Cumulative Target",
+                line=dict(color=target_color, width=2, dash="dash"),
+            ))
+            fig_cum.update_layout(
+                height=380,
+                margin=dict(l=20, r=20, t=30, b=20),
+                xaxis_title="Week",
+                yaxis_title="Cumulative Enrolled",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            )
+            st.plotly_chart(fig_cum, use_container_width=True)
 
-        with trend_col2:
-            st.subheader("Enrollments by Week")
-            if not weekly_enrollment.empty:
-                fig_weekly = px.bar(
-                    weekly_enrollment,
-                    x="Week",
-                    y="Enrollments",
-                    text="Enrollments",
-                    height=340,
-                )
-                fig_weekly.update_traces(
-                    marker_color=rocket_colors(len(weekly_enrollment)),
-                    textposition="outside",
-                )
-                fig_weekly.add_hline(
-                    y=4,
-                    line_dash="dash",
-                    line_width=2,
-                    line_color="#e63946",
-                    annotation_text="Target: 4/week",
-                    annotation_position="top left",
-                    annotation_font_color="#e63946",
-                )
-                fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
-                st.plotly_chart(fig_weekly, use_container_width=True)
+            latest = cumulative_stratified.iloc[-1]
+            gap = int(latest["Cumulative Target"] - latest["Cumulative Enrolled"])
+            if gap > 0:
+                gap_text = f"{gap} behind target"
+            elif gap < 0:
+                gap_text = f"{abs(gap)} ahead of target"
             else:
-                st.info("No enrollment date data available yet.")
+                gap_text = "on target"
+            st.caption(
+                f"Latest week: {int(latest['Cumulative Enrolled'])} achieved vs "
+                f"{int(latest['Cumulative Target'])} targeted ({gap_text})."
+            )
+        else:
+            st.info("No stratification date data available yet.")
+
+        st.markdown("---")
+
+        st.subheader("Enrollments by Week")
+        if not weekly_enrollment.empty:
+            fig_weekly = px.bar(
+                weekly_enrollment,
+                x="Week",
+                y="Enrollments",
+                text="Enrollments",
+                height=340,
+            )
+            fig_weekly.update_traces(
+                marker_color=rocket_colors(len(weekly_enrollment)),
+                textposition="outside",
+            )
+            fig_weekly.add_hline(
+                y=WEEKLY_ENROLLMENT_TARGET,
+                line_dash="dash",
+                line_width=2,
+                line_color="#e63946",
+                annotation_text=f"Target: {WEEKLY_ENROLLMENT_TARGET}/week",
+                annotation_position="top left",
+                annotation_font_color="#e63946",
+            )
+            fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
+            st.plotly_chart(fig_weekly, use_container_width=True)
+        else:
+            st.info("No enrollment date data available yet.")
 
         st.markdown("---")
 
@@ -1361,25 +1408,52 @@ def main():
                 st.warning(psf_session_warning)
             if not psf_session_summary.empty:
                 st.markdown(f"**Total PSF Assigned: {total_psf_assigned}**")
-                fig_psf_sessions = px.bar(
-                    psf_session_summary,
-                    x="Session",
-                    y="Done",
-                    text=psf_session_summary.apply(
-                        lambda r: f"{int(r['Done'])} ({r['Percent']:.0f}%)", axis=1
+
+                psf_plot_df = psf_session_summary.copy()
+                psf_plot_df["Not Done"] = psf_plot_df["Total"] - psf_plot_df["Done"]
+                psf_plot_df["Done %"] = psf_plot_df["Percent"]
+                psf_plot_df["Not Done %"] = 100 - psf_plot_df["Done %"]
+
+                # Reverse row order so Session 1 renders at the top of the
+                # horizontal bar chart (Plotly draws categories bottom-up).
+                psf_plot_df = psf_plot_df.iloc[::-1].reset_index(drop=True)
+
+                fig_psf_sessions = go.Figure()
+                fig_psf_sessions.add_trace(go.Bar(
+                    y=psf_plot_df["Session"],
+                    x=psf_plot_df["Done %"],
+                    name="Completed",
+                    orientation="h",
+                    marker_color="#2e7d32",
+                    customdata=psf_plot_df["Done"],
+                    text=psf_plot_df.apply(
+                        lambda r: f"{int(r['Done'])} ({r['Done %']:.0f}%)", axis=1
                     ),
-                    labels={"Done": "Participants (n)"},
-                    height=380,
-                )
-                fig_psf_sessions.update_traces(
-                    marker_color=rocket_colors(len(psf_session_summary)),
-                    textposition="outside",
-                )
+                    textposition="inside",
+                    hovertemplate="%{y}: %{customdata} completed (%{x:.0f}%)<extra></extra>",
+                ))
+                fig_psf_sessions.add_trace(go.Bar(
+                    y=psf_plot_df["Session"],
+                    x=psf_plot_df["Not Done %"],
+                    name="Not Completed",
+                    orientation="h",
+                    marker_color="#dc3545",
+                    customdata=psf_plot_df["Not Done"],
+                    text=psf_plot_df.apply(
+                        lambda r: f"{int(r['Not Done'])} ({r['Not Done %']:.0f}%)", axis=1
+                    ),
+                    textposition="inside",
+                    hovertemplate="%{y}: %{customdata} not completed (%{x:.0f}%)<extra></extra>",
+                ))
                 fig_psf_sessions.update_layout(
-                    yaxis=dict(range=[0, total_psf_assigned * 1.15 if total_psf_assigned else 1]),
+                    barmode="stack",
+                    height=380,
                     margin=dict(l=20, r=20, t=30, b=20),
                     title=f"PSF Sessions Completed (N={total_psf_assigned})",
                     title_font=dict(size=18, color="#4a90d9"),
+                    xaxis=dict(title="% of PSF Assigned", range=[0, 100], ticksuffix="%"),
+                    yaxis=dict(title=""),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
                 )
                 st.plotly_chart(fig_psf_sessions, use_container_width=True)
                 st.dataframe(
