@@ -1445,16 +1445,16 @@ def main():
                     textposition="inside",
                     hovertemplate="%{y}: %{customdata} not completed (%{x:.0f}%)<extra></extra>",
                 ))
-                fig_psf_sessions.update_layout(
-                    barmode="stack",
-                    height=380,
-                    margin=dict(l=20, r=20, t=30, b=20),
-                    title=f"Total Participants on PSF (N={total_psf_assigned})",
-                    title_font=dict(size=18, color="#4a90d9"),
-                    xaxis=dict(title="% of PSF", range=[0, 100], ticksuffix="%"),
-                    yaxis=dict(title=""),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0),
-                )
+ #               fig_psf_sessions.update_layout(
+ #                   barmode="stack",
+ #                   height=380,
+ #                   margin=dict(l=20, r=20, t=30, b=20),
+ #                   title=f"Total Participants on PSF (N={total_psf_assigned})",
+ #                   title_font=dict(size=18, color="#4a90d9"),
+ #                   xaxis=dict(title="% of PSF", range=[0, 100], ticksuffix="%"),
+ #                   yaxis=dict(title=""),
+  #                  legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+  #              )
                 st.plotly_chart(fig_psf_sessions, use_container_width=True)
                 st.dataframe(
                     psf_session_summary.assign(
