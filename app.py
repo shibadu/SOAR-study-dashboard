@@ -283,6 +283,74 @@ def load_behavioral_tracking(_proj):
     )
 
 
+@st.cache_data(ttl=1800, show_spinner="Pulling adverse event log...")
+def load_adverse_events(_proj):
+    """Export the adverse_event_log form directly.
+
+    ae_severity and ae_outcome live on the separate, repeating
+    `adverse_event_log` instrument, just like bt_intervention_type lives on
+    behavioral_tracking above. A project-wide export can omit a form/field
+    the API user's export permissions don't include, so do not depend on
+    the main export containing them.
+    """
+    if _proj is None:
+        return pd.DataFrame(), "REDCap connection is not available."
+
+    ae_fields = [
+        "record_id",
+        "ae_participant_id",
+        "ae_date_onset",
+        AE_SEVERITY_FIELD,
+        AE_OUTCOME_FIELD,
+    ]
+
+    # Preferred: explicitly request the form and fields.
+    try:
+        records = _proj.export_records(
+            fields=ae_fields,
+            forms=["adverse_event_log"],
+            raw_or_label="raw",
+        )
+        if isinstance(records, pd.DataFrame):
+            df = records.reset_index()
+        else:
+            df = pd.DataFrame(records)
+
+        if AE_SEVERITY_FIELD in df.columns:
+            return df, None
+    except Exception as e:
+        first_error = str(e)
+    else:
+        first_error = "The requested field was not returned."
+
+    # Fallback: request the fields directly without restricting by form.
+    try:
+        records = _proj.export_records(
+            fields=ae_fields,
+            raw_or_label="raw",
+        )
+        if isinstance(records, pd.DataFrame):
+            df = records.reset_index()
+        else:
+            df = pd.DataFrame(records)
+
+        if AE_SEVERITY_FIELD in df.columns:
+            return df, None
+    except Exception as e:
+        second_error = str(e)
+    else:
+        second_error = "The field was not returned."
+
+    return (
+        pd.DataFrame(),
+        f"REDCap did not return '{AE_SEVERITY_FIELD}' from the Adverse Event "
+        "Log form. The data dictionary confirms this field belongs to the "
+        "'adverse_event_log' instrument. Check the API token/user's Data "
+        "Export rights for that instrument. "
+        f"API details: {first_error}; fallback: {second_error}.",
+    )
+
+
 def build_psf_ba_distribution(df_behavioral):
     """Count + percentage of participants assigned to PSF vs BA.
 
@@ -410,7 +478,10 @@ def build_ae_summary(df_all):
     breakdown (Mild/Moderate/Severe), and outcome breakdown.
 
     Source: the repeating `adverse_event_log` instrument (ae_severity,
-    ae_outcome). AEs are counted as events (rows), regardless of which
+    ae_outcome), normally passed in as the dedicated export from
+    load_adverse_events() rather than the project-wide export, since export
+    permissions can omit this form from the latter. AEs are counted as
+    events (rows), regardless of which
     participant/record_id they belong to — a participant with several
     logged events contributes several rows here, by design.
     """
@@ -1060,7 +1131,15 @@ def main():
     overdue = get_overdue_visits(df_clinical, df_visits)
     safety = get_safety_screening_summary(df_clinical)
     strata_summary = build_stratification_summary(df_clinical)
-    ae_records, ae_severity_summary, ae_outcome_summary, ae_warning = build_ae_summary(df_all)
+
+    # ae_severity / ae_outcome live on the separate, repeating
+    # adverse_event_log instrument, so pull that form directly instead of
+    # relying on the project-wide export (same reasoning as
+    # behavioral_tracking below).
+    df_ae, ae_export_error = load_adverse_events(proj)
+    ae_records, ae_severity_summary, ae_outcome_summary, ae_warning = build_ae_summary(df_ae)
+    if ae_export_error and ae_records.empty:
+        ae_warning = ae_export_error
     total_ae = int(len(ae_records))
     strata_demographics = build_stratified_demographics(df_clinical, df_prescreen)
     weekly_enrollment, cumulative_stratified = build_weekly_enrollment_trends(df_clinical)
