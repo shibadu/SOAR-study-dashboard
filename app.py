@@ -121,6 +121,25 @@ PSF_SESSION_STATUS_LABELS = {
     field: f"Session {i}" for i, field in enumerate(PSF_SESSION_STATUS_FIELDS, start=1)
 }
 
+# Adverse Event Log fields, from the repeating `adverse_event_log` instrument
+# (data dictionary: ae_severity, ae_outcome). AEs are captured one row per
+# event (redcap_repeat_instrument == "Adverse Event Log"), so a participant
+# with multiple events contributes multiple rows — summaries below count
+# events, not unique participants.
+AE_REPEAT_INSTRUMENT_LABEL = "adverse event log"
+AE_SEVERITY_FIELD = "ae_severity"
+AE_SEVERITY_MAP = {"1": "Mild", "2": "Moderate", "3": "Severe"}
+AE_SEVERITY_ORDER = ["Mild", "Moderate", "Severe"]
+AE_OUTCOME_FIELD = "ae_outcome"
+AE_OUTCOME_MAP = {
+    "1": "Recovered",
+    "2": "Recovering",
+    "3": "Ongoing",
+    "4": "Recovered with sequelae",
+    "5": "Fatal",
+    "6": "Unknown",
+}
+
 
 # Rocket colorscale stops (seaborn's "rocket" palette, sampled 0→1),
 # used in place of Viridis for all standard bar/line/pie charts.
@@ -384,6 +403,74 @@ def build_psf_session_summary(df_behavioral):
             + ", ".join(missing_fields)
         )
     return summary, total_psf, warning
+
+
+def build_ae_summary(df_all):
+    """Summarize Adverse Event Log entries: total count, severity
+    breakdown (Mild/Moderate/Severe), and outcome breakdown.
+
+    Source: the repeating `adverse_event_log` instrument (ae_severity,
+    ae_outcome). AEs are counted as events (rows), regardless of which
+    participant/record_id they belong to — a participant with several
+    logged events contributes several rows here, by design.
+    """
+    empty_severity = pd.DataFrame(columns=["Severity", "Count"])
+    empty_outcome = pd.DataFrame(columns=["Outcome", "Count"])
+    empty_ae = pd.DataFrame()
+
+    if df_all.empty or AE_SEVERITY_FIELD not in df_all.columns:
+        return empty_ae, empty_severity, empty_outcome, (
+            "Adverse Event Log fields were not returned by the export."
+        )
+
+    df = df_all.copy()
+    if "redcap_repeat_instrument" in df.columns:
+        ae = df[
+            df["redcap_repeat_instrument"].astype(str).str.strip().str.lower()
+            == AE_REPEAT_INSTRUMENT_LABEL
+        ]
+        # Fall back to rows with a populated severity/outcome value, in case
+        # the repeat-instrument marker column is blank or absent for this
+        # export configuration.
+        if ae.empty:
+            outcome_series = df[AE_OUTCOME_FIELD] if AE_OUTCOME_FIELD in df.columns else pd.Series(dtype=object)
+            ae = df[df[AE_SEVERITY_FIELD].notna() | outcome_series.notna()]
+    else:
+        ae = df[df[AE_SEVERITY_FIELD].notna()]
+
+    total_ae = int(len(ae))
+    if total_ae == 0:
+        return ae, empty_severity, empty_outcome, "No Adverse Event Log entries recorded yet."
+
+    def _label_counts(series, code_map, order=None):
+        vals = series.astype(str).str.strip()
+        # Raw REDCap codes (e.g. "1", "2") map through code_map; values that
+        # are already label text (e.g. a labeled export returning "Mild"
+        # directly) pass through unchanged.
+        mapped = vals.map(code_map).fillna(vals)
+        mapped = mapped.replace({"nan": None, "": None, "None": None}).dropna()
+        counts = mapped.value_counts()
+        if order:
+            ordered_index = [c for c in order if c in counts.index] + [
+                c for c in counts.index if c not in order
+            ]
+            counts = counts.reindex(ordered_index)
+        return counts
+
+    severity_counts = _label_counts(ae[AE_SEVERITY_FIELD], AE_SEVERITY_MAP, AE_SEVERITY_ORDER)
+    severity_summary = pd.DataFrame(
+        {"Severity": severity_counts.index, "Count": severity_counts.values.astype(int)}
+    )
+
+    if AE_OUTCOME_FIELD in ae.columns:
+        outcome_counts = _label_counts(ae[AE_OUTCOME_FIELD], AE_OUTCOME_MAP)
+        outcome_summary = pd.DataFrame(
+            {"Outcome": outcome_counts.index, "Count": outcome_counts.values.astype(int)}
+        )
+    else:
+        outcome_summary = empty_outcome
+
+    return ae, severity_summary, outcome_summary, None
 
 # ───────────────────────────────────────────────────────────────
 # DATA PROCESSING
@@ -973,6 +1060,8 @@ def main():
     overdue = get_overdue_visits(df_clinical, df_visits)
     safety = get_safety_screening_summary(df_clinical)
     strata_summary = build_stratification_summary(df_clinical)
+    ae_records, ae_severity_summary, ae_outcome_summary, ae_warning = build_ae_summary(df_all)
+    total_ae = int(len(ae_records))
     strata_demographics = build_stratified_demographics(df_clinical, df_prescreen)
     weekly_enrollment, cumulative_stratified = build_weekly_enrollment_trends(df_clinical)
     weekly_retention = build_weekly_retention(visit_matrix)
@@ -1407,7 +1496,7 @@ def main():
             if psf_session_warning:
                 st.warning(psf_session_warning)
             if not psf_session_summary.empty:
-                st.markdown(f"**Total PSF: {total_psf_assigned}**")
+                st.markdown(f"**Total PSF Assigned: {total_psf_assigned}**")
 
                 psf_plot_df = psf_session_summary.copy()
                 psf_plot_df["Not Done"] = psf_plot_df["Total"] - psf_plot_df["Done"]
@@ -1449,12 +1538,12 @@ def main():
                     barmode="stack",
                     height=380,
                     margin=dict(l=20, r=20, t=30, b=20),
- #                   title=f"Total Participants on PSF (N={total_psf_assigned})",
- #                   title_font=dict(size=18, color="#4a90d9"),
-                    xaxis=dict(title="% of PSF", range=[0, 100], ticksuffix="%"),
+                    title=f"PSF Sessions Completed (N={total_psf_assigned})",
+                    title_font=dict(size=18, color="#4a90d9"),
+                    xaxis=dict(title="% of PSF Assigned", range=[0, 100], ticksuffix="%"),
                     yaxis=dict(title=""),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-              )
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
                 st.plotly_chart(fig_psf_sessions, use_container_width=True)
                 st.dataframe(
                     psf_session_summary.assign(
@@ -1479,8 +1568,8 @@ def main():
             unsafe_allow_html=True,
         )
 
-        tab1, tab2, tab3 = st.tabs(
-            ["Overdue Visits", "Upcoming Visits", "Protocol Deviations"]
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["Overdue Visits", "Upcoming Visits", "Protocol Deviations", "Adverse Events"]
         )
 
         with tab1:
@@ -1512,6 +1601,80 @@ def main():
                     st.success("No protocol deviations recorded.")
             else:
                 st.info("No protocol deviation data available.")
+
+        with tab4:
+            st.subheader(f"Adverse Events ({total_ae})")
+            st.caption(
+                "AEs are logged on a repeating form, so counts here are of "
+                "events — a participant with more than one AE is counted "
+                "once per event, not once per participant."
+            )
+            if ae_warning:
+                st.info(ae_warning)
+            else:
+                severity_lookup = dict(
+                    zip(ae_severity_summary["Severity"], ae_severity_summary["Count"])
+                )
+                ae_kpi1, ae_kpi2, ae_kpi3, ae_kpi4 = st.columns(4)
+                ae_kpi1.metric("Total AEs", total_ae)
+                ae_kpi2.metric("Mild", int(severity_lookup.get("Mild", 0)))
+                ae_kpi3.metric("Moderate", int(severity_lookup.get("Moderate", 0)))
+                ae_kpi4.metric("Severe", int(severity_lookup.get("Severe", 0)))
+
+                st.markdown("---")
+
+                ae_col1, ae_col2 = st.columns(2)
+
+                with ae_col1:
+                    st.markdown("**By Severity**")
+                    if not ae_severity_summary.empty:
+                        fig_ae_severity = px.bar(
+                            ae_severity_summary,
+                            x="Severity",
+                            y="Count",
+                            text="Count",
+                            height=320,
+                        )
+                        fig_ae_severity.update_traces(
+                            marker_color=rocket_colors(len(ae_severity_summary)),
+                            textposition="outside",
+                        )
+                        fig_ae_severity.update_layout(
+                            showlegend=False, margin=dict(l=20, r=20, t=20, b=20)
+                        )
+                        st.plotly_chart(fig_ae_severity, use_container_width=True)
+                        st.dataframe(
+                            ae_severity_summary, use_container_width=True, hide_index=True
+                        )
+                    else:
+                        st.info("No severity data available for recorded AEs.")
+
+                with ae_col2:
+                    st.markdown("**By Outcome**")
+                    if not ae_outcome_summary.empty:
+                        fig_ae_outcome = px.bar(
+                            ae_outcome_summary,
+                            x="Count",
+                            y="Outcome",
+                            text="Count",
+                            orientation="h",
+                            height=320,
+                        )
+                        fig_ae_outcome.update_traces(
+                            marker_color=rocket_colors(len(ae_outcome_summary)),
+                            textposition="outside",
+                        )
+                        fig_ae_outcome.update_layout(
+                            showlegend=False,
+                            margin=dict(l=20, r=20, t=20, b=20),
+                            yaxis=dict(categoryorder="total ascending"),
+                        )
+                        st.plotly_chart(fig_ae_outcome, use_container_width=True)
+                        st.dataframe(
+                            ae_outcome_summary, use_container_width=True, hide_index=True
+                        )
+                    else:
+                        st.info("No outcome data available for recorded AEs.")
 
 if __name__ == "__main__":
     main()
