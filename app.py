@@ -16,6 +16,7 @@ Environment variables:
 """
 
 import os
+import re
 from datetime import datetime, timedelta
 
 import streamlit as st
@@ -123,10 +124,14 @@ PSF_SESSION_STATUS_LABELS = {
 
 # Adverse Event Log fields, from the repeating `adverse_event_log` instrument
 # (data dictionary: ae_severity, ae_outcome). AEs are captured one row per
-# event (redcap_repeat_instrument == "Adverse Event Log"), so a participant
-# with multiple events contributes multiple rows — summaries below count
-# events, not unique participants.
-AE_REPEAT_INSTRUMENT_LABEL = "adverse event log"
+# event, so a participant with multiple events contributes multiple rows —
+# summaries below count events, not unique participants.
+#
+# NOTE: a raw export returns the instrument's *unique name*
+# ("adverse_event_log") in redcap_repeat_instrument, while a labelled export
+# returns the *label* ("Adverse Event Log"). Comparisons go through
+# _norm_instrument() so either form matches.
+AE_REPEAT_INSTRUMENT_LABEL = "adverse_event_log"
 AE_SEVERITY_FIELD = "ae_severity"
 AE_SEVERITY_MAP = {"1": "Mild", "2": "Moderate", "3": "Severe"}
 AE_SEVERITY_ORDER = ["Mild", "Moderate", "Severe"]
@@ -139,6 +144,26 @@ AE_OUTCOME_MAP = {
     "5": "Fatal",
     "6": "Unknown",
 }
+
+
+def _norm_instrument(value):
+    """Normalize a REDCap instrument name/label for comparison.
+
+    "Adverse Event Log", "adverse event log" and "adverse_event_log" all
+    normalize to "adverse_event_log", so the same filter works whether the
+    export was raw or labelled.
+    """
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
+def _is_blank(series):
+    """True where a REDCap value is effectively empty.
+
+    A REDCap/PyCap export returns unfilled fields as empty strings rather
+    than NaN, so .notna() is True for every row and cannot be used to tell
+    populated rows from blank ones.
+    """
+    return series.astype(str).str.strip().replace({"nan": "", "None": ""}) == ""
 
 
 # Rocket colorscale stops (seaborn's "rocket" palette, sampled 0→1),
@@ -495,19 +520,35 @@ def build_ae_summary(df_all):
         )
 
     df = df_all.copy()
+
+    def _populated_ae_rows(frame):
+        """Rows carrying actual AE content.
+
+        Keyed on identity/onset first (populated the moment an AE row is
+        created) so an event still awaiting severity or outcome grading is
+        not silently dropped from the count.
+        """
+        mask = None
+        for col in ("ae_participant_id", "ae_date_onset", AE_SEVERITY_FIELD, AE_OUTCOME_FIELD):
+            if col in frame.columns:
+                filled = ~_is_blank(frame[col])
+                mask = filled if mask is None else (mask | filled)
+        if mask is None:
+            return frame.iloc[0:0]
+        return frame[mask]
+
     if "redcap_repeat_instrument" in df.columns:
         ae = df[
-            df["redcap_repeat_instrument"].astype(str).str.strip().str.lower()
-            == AE_REPEAT_INSTRUMENT_LABEL
+            df["redcap_repeat_instrument"].map(_norm_instrument)
+            == _norm_instrument(AE_REPEAT_INSTRUMENT_LABEL)
         ]
-        # Fall back to rows with a populated severity/outcome value, in case
-        # the repeat-instrument marker column is blank or absent for this
+        # Fall back to rows with populated AE content, in case the
+        # repeat-instrument marker column is blank or absent for this
         # export configuration.
         if ae.empty:
-            outcome_series = df[AE_OUTCOME_FIELD] if AE_OUTCOME_FIELD in df.columns else pd.Series(dtype=object)
-            ae = df[df[AE_SEVERITY_FIELD].notna() | outcome_series.notna()]
+            ae = _populated_ae_rows(df)
     else:
-        ae = df[df[AE_SEVERITY_FIELD].notna()]
+        ae = _populated_ae_rows(df)
 
     total_ae = int(len(ae))
     if total_ae == 0:
