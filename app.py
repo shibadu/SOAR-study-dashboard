@@ -1453,7 +1453,7 @@ def main():
                     title_font=dict(size=18, color="#4a90d9"),
                     xaxis=dict(title="% of PSF", range=[0, 100], ticksuffix="%"),
                     yaxis=dict(title=""),
-                    legend=dict(orientation="h", yanchor="bottom", y=0.80, xanchor="left", x=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0),
                 )
                 st.plotly_chart(fig_psf_sessions, use_container_width=True)
                 st.dataframe(
