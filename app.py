@@ -1407,7 +1407,7 @@ def main():
             if psf_session_warning:
                 st.warning(psf_session_warning)
             if not psf_session_summary.empty:
-                st.markdown(f"**Total PSF Assigned: {total_psf_assigned}**")
+                st.markdown(f"**Total PSF: {total_psf_assigned}**")
 
                 psf_plot_df = psf_session_summary.copy()
                 psf_plot_df["Not Done"] = psf_plot_df["Total"] - psf_plot_df["Done"]
@@ -1451,7 +1451,7 @@ def main():
                     margin=dict(l=20, r=20, t=30, b=20),
                     title=f"PSF Sessions Completed (N={total_psf_assigned})",
                     title_font=dict(size=18, color="#4a90d9"),
-                    xaxis=dict(title="% of PSF Assigned", range=[0, 100], ticksuffix="%"),
+                    xaxis=dict(title="% of PSF", range=[0, 100], ticksuffix="%"),
                     yaxis=dict(title=""),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
                 )
