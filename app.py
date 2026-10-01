@@ -73,6 +73,11 @@ st.markdown("""
     /* Hide the "Made with Streamlit" / GitHub footer badges at the bottom of the page */
     footer { visibility: hidden !important; height: 0 !important; }
     [data-testid="stFooter"] { visibility: hidden !important; height: 0 !important; }
+    a[href*="streamlit.io"],
+    a[href*="github.com"],
+    [data-testid="stToolbarActions"],
+    [data-testid="stAppDeployButton"],
+    [class*="viewerBadge"],
     a[href*="github.com"][class*="viewerBadge"],
     .viewerBadge_link__qRIco,
     .viewerBadge_container__1QSob { display: none !important; }
@@ -118,6 +123,19 @@ BEHAVIORAL_INTERVENTION_MAP = {"1": "PSF", "2": "BA", "PSF": "PSF", "BA": "BA"}
 # coded 1 = Done, 0 = Not Done, and only populated when
 # bt_intervention_type = 1 (PSF).
 PSF_SESSION_STATUS_FIELDS = [f"bt_psf_s{i}_status" for i in range(1, 9)]
+# Days after Day 0 (medication/intervention date) at which each PSF session
+# falls due, Session 1..8. NOTE: Session 4 was given as "+ 4" in the request;
+# +22 is assumed here (the schedule is otherwise 14 days apart from Session 5
+# onward). Change this one number if the protocol says otherwise.
+PSF_SESSION_DAY_OFFSETS = [0, 8, 15, 22, 36, 50, 64, 78]
+
+# Field holding Day 0 (medication/intervention date), tried in order.
+# "day_0_due" is already used elsewhere in this app, so it is the fallback.
+DAY0_FIELD_CANDIDATES = [
+    "day_0_date", "day0_date", "medication_date", "med_date",
+    "intervention_date", "ce_medication_date", "day_0_due",
+]
+
 PSF_SESSION_STATUS_LABELS = {
     field: f"Session {i}" for i, field in enumerate(PSF_SESSION_STATUS_FIELDS, start=1)
 }
@@ -137,12 +155,15 @@ AE_SEVERITY_MAP = {"1": "Mild", "2": "Moderate", "3": "Severe"}
 AE_SEVERITY_ORDER = ["Mild", "Moderate", "Severe"]
 AE_OUTCOME_FIELD = "ae_outcome"
 AE_OUTCOME_MAP = {
-    "1": "Recovered",
+    "1": "Resolved",
     "2": "Recovering",
     "3": "Ongoing",
-    "4": "Recovered with sequelae",
+    "4": "Resolved with sequelae",
     "5": "Fatal",
     "6": "Unknown",
+    # A labelled export returns the old label text; map it to the new wording.
+    "Recovered": "Resolved",
+    "Recovered with sequelae": "Resolved with sequelae",
 }
 
 
@@ -426,16 +447,41 @@ def build_psf_ba_distribution(df_behavioral):
     return dist, None
 
 
-def build_psf_session_summary(df_behavioral):
-    """n (%) of PSF-assigned participants who completed each of the 8
-    follow-up sessions.
+def get_day0_dates(df_all):
+    """Return (Series record_id -> Day 0 date, field_name used or None)."""
+    empty = pd.Series(dtype="datetime64[ns]")
+    if df_all is None or df_all.empty:
+        return empty, None
+    id_col = "record_id" if "record_id" in df_all.columns else df_all.columns[0]
+    field = next((c for c in DAY0_FIELD_CANDIDATES if c in df_all.columns), None)
+    if field is None:
+        return empty, None
+    d = df_all[[id_col, field]].copy()
+    d[id_col] = d[id_col].astype(str)
+    d[field] = pd.to_datetime(d[field], errors="coerce")
+    d = d.dropna(subset=[field])
+    if d.empty:
+        return empty, field
+    return d.groupby(id_col)[field].min(), field
 
-    Source: behavioral_tracking.bt_psf_s1_status ... bt_psf_s8_status.
-    REDCap coding: 1 = Done, 0 = Not Done. Denominator (N) is the total
-    number of participants assigned to PSF, since only PSF participants
-    have these fields populated.
+
+def build_psf_session_summary(df_behavioral, day0_dates=None):
+    """Per-session status for PSF-assigned participants.
+
+    Source: behavioral_tracking.bt_psf_s1_status ... bt_psf_s8_status
+    (1 = Done, 0 = Not Done) plus Day 0 and PSF_SESSION_DAY_OFFSETS.
+
+    For each session:
+      Due        = today >= Day 0 + offset (or the session is documented Done)
+      Completed  = Done documented
+      Missed     = Due and (Not Done, or not filled)
+      Pending    = not yet due   (Due = Completed + Missed)
+    Participants with no Day 0 date cannot be dated, so anything not
+    completed for them is counted as Pending.
+    Returns (summary_df, total_psf, warning).
     """
-    empty = pd.DataFrame(columns=["Session", "Done", "Total", "Percent"])
+    cols = ["Session", "Due", "Completed", "Missed", "Pending", "Total"]
+    empty = pd.DataFrame(columns=cols)
     if df_behavioral.empty:
         return empty, 0, "No Behavioral Tracking records were returned."
 
@@ -445,25 +491,24 @@ def build_psf_session_summary(df_behavioral):
 
     id_col = "record_id" if "record_id" in df_behavioral.columns else df_behavioral.columns[0]
 
-    df = df_behavioral.copy()
+    raw = df_behavioral.copy()
+    raw[id_col] = raw[id_col].astype(str)
+
+    df = raw.copy()
     df[field] = df[field].astype(str).str.strip().str.upper()
     df["Label"] = df[field].map(BEHAVIORAL_INTERVENTION_MAP)
-
-    # behavioral_tracking has multiple rows per participant (assignment row
-    # plus session rows), and bt_intervention_type is only populated on some
-    # of them. Drop rows with no valid Label BEFORE deduplicating, or
-    # drop_duplicates can keep a blank row and lose the real assignment —
-    # same ordering as build_psf_ba_distribution, which this must match.
+    # Drop rows with no valid Label BEFORE deduplicating (same ordering as
+    # build_psf_ba_distribution, which this must match).
     df = df.dropna(subset=["Label"])
     df = df.drop_duplicates(subset=[id_col], keep="first")
-    psf_df = df[df["Label"] == "PSF"]
+    psf_ids = pd.Index(df.loc[df["Label"] == "PSF", id_col].unique())
 
-    total_psf = int(len(psf_df))
+    total_psf = int(len(psf_ids))
     if total_psf == 0:
         return empty, 0, "No participants have been assigned to PSF yet."
 
-    missing_fields = [f for f in PSF_SESSION_STATUS_FIELDS if f not in psf_df.columns]
-    if len(missing_fields) == len(PSF_SESSION_STATUS_FIELDS):
+    present = [f for f in PSF_SESSION_STATUS_FIELDS if f in raw.columns]
+    if not present:
         return (
             empty,
             total_psf,
@@ -471,31 +516,69 @@ def build_psf_session_summary(df_behavioral):
             "bt_psf_s8_status) were returned by the export.",
         )
 
+    # Session statuses may sit on a different row from the assignment row,
+    # so combine every row per participant: any "1" wins, then any "0".
+    def _combine(series):
+        v = series.astype(str).str.strip()
+        if (v == "1").any():
+            return "1"
+        if (v == "0").any():
+            return "0"
+        return ""
+
+    sub = raw[raw[id_col].isin(psf_ids)]
+    status = sub.groupby(id_col)[present].agg(_combine).reindex(psf_ids).fillna("")
+
+    if day0_dates is not None and len(day0_dates) > 0:
+        day0 = day0_dates.reindex(psf_ids)
+    else:
+        day0 = pd.Series(pd.NaT, index=psf_ids, dtype="datetime64[ns]")
+
+    today = pd.Timestamp.now().normalize()
     rows = []
-    for i, sess_field in enumerate(PSF_SESSION_STATUS_FIELDS, start=1):
-        if sess_field in psf_df.columns:
-            vals = psf_df[sess_field].astype(str).str.strip()
-            done = int((vals == "1").sum())
+    for i, (sess_field, offset) in enumerate(
+        zip(PSF_SESSION_STATUS_FIELDS, PSF_SESSION_DAY_OFFSETS), start=1
+    ):
+        if sess_field in status.columns:
+            completed = status[sess_field] == "1"
         else:
-            done = 0
+            completed = pd.Series(False, index=psf_ids)
+        due_date = day0 + pd.Timedelta(days=offset)
+        due = (due_date.notna() & (today >= due_date)) | completed
+        missed = due & ~completed
+        pending = ~due
         rows.append(
             {
                 "Session": f"Session {i}",
-                "Done": done,
+                "Due": int(due.sum()),
+                "Completed": int(completed.sum()),
+                "Missed": int(missed.sum()),
+                "Pending": int(pending.sum()),
                 "Total": total_psf,
-                "Percent": round(done / total_psf * 100, 1) if total_psf else 0,
             }
         )
 
     summary = pd.DataFrame(rows)
-    warning = None
+    notes = []
+    missing_fields = [f for f in PSF_SESSION_STATUS_FIELDS if f not in raw.columns]
     if missing_fields:
-        warning = (
-            f"{len(missing_fields)} of 8 session status fields were not "
-            "returned by the export and are shown as 0 done: "
-            + ", ".join(missing_fields)
+        notes.append(
+            f"{len(missing_fields)} of 8 session status fields were not returned "
+            "and are treated as not filled: " + ", ".join(missing_fields)
         )
-    return summary, total_psf, warning
+    n_no_day0 = int(day0.isna().sum())
+    if n_no_day0 == total_psf:
+        notes.append(
+            "No Day 0 (medication/intervention) date was found for any PSF "
+            "participant, so due dates cannot be calculated. Set "
+            "DAY0_FIELD_CANDIDATES to the right field name."
+        )
+    elif n_no_day0:
+        notes.append(
+            f"{n_no_day0} PSF participant(s) have no Day 0 date; their "
+            "uncompleted sessions are counted as Pending."
+        )
+    return summary, total_psf, (" ".join(notes) if notes else None)
 
 
 def build_ae_summary(df_all):
@@ -709,7 +792,7 @@ def build_visit_matrix(df_visits):
         "1": "Completed",
         "2": "Missed",
         "3": "Rescheduled",
-        "4": "Early Term",
+        "4": "Withdrawn/Discontinued",
     }
     matrix = matrix.map(
         lambda x: status_map.get(str(x), "Pending") if pd.notna(x) else "Pending"
@@ -1008,7 +1091,7 @@ def build_weekly_enrollment_trends(df_clinical):
 def build_weekly_retention(visit_matrix):
     """Retention rate per visit week: Completed / (Completed + Missed + Rescheduled).
 
-    Pending and Early Term rows are excluded from both numerator and
+    Pending and Withdrawn/Discontinued rows are excluded from both numerator and
     denominator since they aren't yet a completed-or-failed outcome.
     """
     if visit_matrix.empty:
@@ -1191,8 +1274,9 @@ def main():
     # so pull that form directly instead of relying on the project-wide export.
     df_behavioral, behavioral_export_error = load_behavioral_tracking(proj)
     psf_ba_distribution, scheduler_error = build_psf_ba_distribution(df_behavioral)
+    day0_dates, day0_field = get_day0_dates(df_all)
     psf_session_summary, total_psf_assigned, psf_session_warning = build_psf_session_summary(
-        df_behavioral
+        df_behavioral, day0_dates
     )
 
     # Prefer the specific behavioral-export error because it is more actionable.
@@ -1344,7 +1428,7 @@ def main():
             status_counts = (
                 visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
             )
-            for status in ["Completed", "Pending", "Missed", "Rescheduled", "Early Term"]:
+            for status in ["Completed", "Pending", "Missed", "Rescheduled", "Withdrawn/Discontinued"]:
                 if status not in status_counts.index:
                     status_counts.loc[status] = 0
 
@@ -1356,7 +1440,7 @@ def main():
                     "Pending": "#ffc107",
                     "Missed": "#dc3545",
                     "Rescheduled": "#17a2b8",
-                    "Early Term": "#6c757d",
+                    "Withdrawn/Discontinued": "#6c757d",
                 },
                 labels={"value": "Participants", "index": "Visit Window"},
                 height=400,
@@ -1565,7 +1649,7 @@ def main():
                     "Pending": "background-color: #d39e00; color: white",
                     "Missed": "background-color: #a71d2a; color: white",
                     "Rescheduled": "background-color: #117a8b; color: white",
-                    "Early Term": "background-color: #495057; color: white",
+                    "Withdrawn/Discontinued": "background-color: #495057; color: white",
                 }
                 return colors.get(val, "")
 
@@ -1617,63 +1701,57 @@ def main():
                 st.warning(psf_session_warning)
             if not psf_session_summary.empty:
                 st.markdown(f"**Total PSF Assigned: {total_psf_assigned}**")
+                if day0_field:
+                    st.caption(
+                        f"Due dates = Day 0 ({day0_field}) + session offsets "
+                        f"{PSF_SESSION_DAY_OFFSETS} days. Due = Completed + Missed; "
+                        "Pending = not yet due."
+                    )
 
-                psf_plot_df = psf_session_summary.copy()
-                psf_plot_df["Not Done"] = psf_plot_df["Total"] - psf_plot_df["Done"]
-                psf_plot_df["Done %"] = psf_plot_df["Percent"]
-                psf_plot_df["Not Done %"] = 100 - psf_plot_df["Done %"]
-
-                # Reverse row order so Session 1 renders at the top of the
-                # horizontal bar chart (Plotly draws categories bottom-up).
-                psf_plot_df = psf_plot_df.iloc[::-1].reset_index(drop=True)
-
+                series_spec = [
+                    ("Due", "Due for Session", "#2980b9"),
+                    ("Completed", "Completed", "#2e7d32"),
+                    ("Pending", "Pending", "#ffc107"),
+                    ("Missed", "Missed", "#dc3545"),
+                ]
                 fig_psf_sessions = go.Figure()
-                fig_psf_sessions.add_trace(go.Bar(
-                    y=psf_plot_df["Session"],
-                    x=psf_plot_df["Done %"],
-                    name="Completed",
-                    orientation="h",
-                    marker_color="#2e7d32",
-                    customdata=psf_plot_df["Done"],
-                    text=psf_plot_df.apply(
-                        lambda r: f"{int(r['Done'])} ({r['Done %']:.0f}%)", axis=1
-                    ),
-                    textposition="inside",
-                    hovertemplate="%{y}: %{customdata} completed (%{x:.0f}%)<extra></extra>",
-                ))
-                fig_psf_sessions.add_trace(go.Bar(
-                    y=psf_plot_df["Session"],
-                    x=psf_plot_df["Not Done %"],
-                    name="Not Completed",
-                    orientation="h",
-                    marker_color="#dc3545",
-                    customdata=psf_plot_df["Not Done"],
-                    text=psf_plot_df.apply(
-                        lambda r: f"{int(r['Not Done'])} ({r['Not Done %']:.0f}%)", axis=1
-                    ),
-                    textposition="inside",
-                    hovertemplate="%{y}: %{customdata} not completed (%{x:.0f}%)<extra></extra>",
-                ))
+                for col, label, color in series_spec:
+                    fig_psf_sessions.add_trace(go.Bar(
+                        y=psf_session_summary["Session"],
+                        x=psf_session_summary[col],
+                        name=label,
+                        orientation="h",
+                        marker_color=color,
+                        text=psf_session_summary[col],
+                        textposition="outside",
+                        hovertemplate=f"%{{y}}: %{{x}} {label.lower()}<extra></extra>",
+                    ))
                 fig_psf_sessions.update_layout(
-                    barmode="stack",
-                    height=380,
-                    margin=dict(l=20, r=20, t=30, b=20),
-                    title=f"PSF Sessions Completed (N={total_psf_assigned})",
+                    barmode="group",
+                    height=620,
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    title=f"PSF Sessions: Due, Completed, Pending, Missed (N={total_psf_assigned})",
                     title_font=dict(size=18, color="#4a90d9"),
-                    xaxis=dict(title="% of PSF Assigned", range=[0, 100], ticksuffix="%"),
-                    yaxis=dict(title=""),
+                    xaxis=dict(title="Participants", range=[0, max(total_psf_assigned, 1) * 1.15]),
+                    yaxis=dict(title="", autorange="reversed"),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
                 )
                 st.plotly_chart(fig_psf_sessions, use_container_width=True)
-                st.dataframe(
-                    psf_session_summary.assign(
-                        **{"n (%)": psf_session_summary.apply(
-                            lambda r: f"{int(r['Done'])} ({r['Percent']:.0f}%)", axis=1
-                        )}
-                    )[["Session", "n (%)", "Total"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+
+                def _n_pct(n, d):
+                    return f"{int(n)} ({(n / d * 100) if d else 0:.0f}%)"
+
+                psf_table = pd.DataFrame({
+                    "Session": psf_session_summary["Session"],
+                    "Due": psf_session_summary["Due"],
+                    "Completed n (% of due)": psf_session_summary.apply(
+                        lambda r: _n_pct(r["Completed"], r["Due"]), axis=1),
+                    "Missed n (% of due)": psf_session_summary.apply(
+                        lambda r: _n_pct(r["Missed"], r["Due"]), axis=1),
+                    "Pending": psf_session_summary["Pending"],
+                    "Total": psf_session_summary["Total"],
+                })
+                st.dataframe(psf_table, use_container_width=True, hide_index=True)
             elif not psf_session_warning:
                 st.info("No PSF session data available yet.")
         else:
@@ -1684,12 +1762,12 @@ def main():
     # ═══════════════════════════════════════════════════════════
     elif view_mode == "Alerts":
         st.markdown(
-            '<div class="main-header">Alerts & Protocol Deviations</div>',
+            '<div class="main-header">Alerts</div>',
             unsafe_allow_html=True,
         )
 
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["Overdue Visits", "Upcoming Visits", "Protocol Deviations", "Adverse Events"]
+        tab1, tab2, tab3 = st.tabs(
+            ["Overdue Visits", "Upcoming Visits", "Adverse Events"]
         )
 
         with tab1:
@@ -1707,22 +1785,6 @@ def main():
                 st.info("No visits due in the next 7 days.")
 
         with tab3:
-            st.subheader("Protocol Deviations")
-            if not df_visits.empty and "protocol_deviation" in df_visits.columns:
-                deviations = df_visits[df_visits["protocol_deviation"] == "1"]
-                if not deviations.empty:
-                    display_cols = [
-                        c
-                        for c in ["record_id", "visit_date", "visit_window", "comment"]
-                        if c in deviations.columns
-                    ]
-                    st.dataframe(deviations[display_cols], use_container_width=True)
-                else:
-                    st.success("No protocol deviations recorded.")
-            else:
-                st.info("No protocol deviation data available.")
-
-        with tab4:
             st.subheader(f"Adverse Events ({total_ae})")
             st.caption(
                 "AEs are logged on a repeating form, so counts here are of "
