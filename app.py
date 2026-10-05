@@ -1031,19 +1031,34 @@ def build_age_group_summary(ages):
     return summary, stats
 
 
-def build_weekly_enrollment_trends(df_clinical):
-    """Weekly enrollment count and cumulative stratified-enrollment trend.
+def build_enrollment_trends(df_clinical, view_by="Weekly"):
+    """Enrollment count and cumulative stratified-enrollment trend, by week or month.
 
     Uses `ce_date` (clinical evaluation date) as the enrollment-event date
     since it's the date field carried on the clinical eligibility form.
     - "Enrolled" = rows where ce_enrollment_decision == "1"
     - "Stratified" = rows where ce_assigned_strata is populated
-    Returns (weekly_enrollment_df, cumulative_stratified_df), each empty if
-    the required fields aren't present.
+
+    view_by: "Weekly" (weeks starting Monday) or "Monthly" (calendar months).
+    Targets scale with the period: WEEKLY_ENROLLMENT_TARGET per week, or
+    WEEKLY_ENROLLMENT_TARGET * (days in month / 7) per month.
+
+    Returns (enrollment_df, cumulative_stratified_df), each empty if the
+    required fields aren't present. Both carry a "Period" label column.
     """
     empty = (pd.DataFrame(), pd.DataFrame())
     if df_clinical.empty or "ce_date" not in df_clinical.columns:
         return empty
+
+    monthly = view_by == "Monthly"
+    freq = "M" if monthly else "W"
+    label_fmt = "%b %Y" if monthly else "%Y-%m-%d"
+
+    def _target_for(period_start):
+        """Enrollment target for the single period starting at period_start."""
+        if monthly:
+            return WEEKLY_ENROLLMENT_TARGET * period_start.days_in_month / 7
+        return WEEKLY_ENROLLMENT_TARGET
 
     df = df_clinical.copy()
     df["ce_date_parsed"] = pd.to_datetime(df["ce_date"], errors="coerce")
@@ -1051,17 +1066,22 @@ def build_weekly_enrollment_trends(df_clinical):
     if df.empty:
         return empty
 
-    df["week"] = df["ce_date_parsed"].dt.to_period("W").apply(lambda p: p.start_time)
+    df["period"] = df["ce_date_parsed"].dt.to_period(freq).apply(lambda p: p.start_time)
 
-    weekly_enrollment = pd.DataFrame()
+    period_enrollment = pd.DataFrame()
     if "ce_enrollment_decision" in df.columns:
         enrolled = df[df["ce_enrollment_decision"] == "1"]
         if not enrolled.empty:
-            weekly_enrollment = (
-                enrolled.groupby("week").size().reset_index(name="Enrollments")
-                .sort_values("week")
+            counts = enrolled.groupby("period").size()
+            # Fill periods with zero enrollments so gaps show as empty bars.
+            full_range = pd.date_range(
+                counts.index.min(), counts.index.max(),
+                freq="MS" if monthly else "7D",
             )
-            weekly_enrollment["Week"] = weekly_enrollment["week"].dt.strftime("%Y-%m-%d")
+            counts = counts.reindex(full_range, fill_value=0)
+            period_enrollment = counts.rename("Enrollments").rename_axis("period").reset_index()
+            period_enrollment["Period"] = period_enrollment["period"].dt.strftime(label_fmt)
+            period_enrollment["Target"] = period_enrollment["period"].apply(_target_for)
 
     cumulative_stratified = pd.DataFrame()
     if "ce_assigned_strata" in df.columns:
@@ -1069,23 +1089,31 @@ def build_weekly_enrollment_trends(df_clinical):
             df["ce_assigned_strata"].notna() & (df["ce_assigned_strata"] != "")
         ]
         if not stratified.empty:
-            weekly_counts = (
-                stratified.groupby("week").size().reset_index(name="Count")
-                .sort_values("week")
+            period_counts = (
+                stratified.groupby("period").size().reset_index(name="Count")
+                .sort_values("period")
             )
-            weekly_counts["Cumulative Enrolled"] = weekly_counts["Count"].cumsum()
+            period_counts["Cumulative Enrolled"] = period_counts["Count"].cumsum()
 
-            # Cumulative Target grows by WEEKLY_ENROLLMENT_TARGET for every
-            # calendar week elapsed since the first stratified enrollment,
-            # so gaps with zero enrollments still count against the target.
-            first_week = weekly_counts["week"].min()
-            weeks_elapsed = ((weekly_counts["week"] - first_week).dt.days // 7) + 1
-            weekly_counts["Cumulative Target"] = weeks_elapsed * WEEKLY_ENROLLMENT_TARGET
+            # Cumulative Target grows for every calendar period elapsed since
+            # the first stratified enrollment, so gaps with zero enrollments
+            # still count against the target.
+            first_period = period_counts["period"].min()
+            if monthly:
+                # Sum the (days-in-month / 7) * weekly target of every month
+                # from the first enrollment month through each row's month.
+                def _cum_target(p):
+                    months = pd.date_range(first_period, p, freq="MS")
+                    return sum(_target_for(m) for m in months)
+                period_counts["Cumulative Target"] = period_counts["period"].apply(_cum_target)
+            else:
+                weeks_elapsed = ((period_counts["period"] - first_period).dt.days // 7) + 1
+                period_counts["Cumulative Target"] = weeks_elapsed * WEEKLY_ENROLLMENT_TARGET
 
-            weekly_counts["Week"] = weekly_counts["week"].dt.strftime("%Y-%m-%d")
-            cumulative_stratified = weekly_counts
+            period_counts["Period"] = period_counts["period"].dt.strftime(label_fmt)
+            cumulative_stratified = period_counts
 
-    return weekly_enrollment, cumulative_stratified
+    return period_enrollment, cumulative_stratified
 
 
 def build_weekly_retention(visit_matrix):
@@ -1266,7 +1294,6 @@ def main():
         ae_warning = ae_export_error
     total_ae = int(len(ae_records))
     strata_demographics = build_stratified_demographics(df_clinical, df_prescreen)
-    weekly_enrollment, cumulative_stratified = build_weekly_enrollment_trends(df_clinical)
     weekly_retention = build_weekly_retention(visit_matrix)
 
     # ── Behavioral Intervention Assigned (PSF vs BA) ──
@@ -1535,14 +1562,27 @@ def main():
 
         st.markdown("---")
 
-        st.subheader("Cumulative Enrollments (by Week)")
+        enroll_view_by = st.radio(
+            "View enrollment graphs by",
+            ["Weekly", "Monthly"],
+            index=0,
+            horizontal=True,
+            key="enrollment_view_by",
+        )
+        period_word = "Week" if enroll_view_by == "Weekly" else "Month"
+        weekly_enrollment, cumulative_stratified = build_enrollment_trends(
+            df_clinical, enroll_view_by
+        )
+        x_axis_type = "category" if enroll_view_by == "Monthly" else None
+
+        st.subheader(f"Cumulative Enrollments (by {period_word})")
         if not cumulative_stratified.empty:
             achieved_color = rocket_colors(3)[1]
             target_color = "#e63946"
 
             fig_cum = go.Figure()
             fig_cum.add_trace(go.Scatter(
-                x=cumulative_stratified["Week"],
+                x=cumulative_stratified["Period"],
                 y=cumulative_stratified["Cumulative Enrolled"],
                 mode="lines+markers+text",
                 name="Cumulative Achieved",
@@ -1552,7 +1592,7 @@ def main():
                 marker=dict(color=achieved_color, size=8),
             ))
             fig_cum.add_trace(go.Scatter(
-                x=cumulative_stratified["Week"],
+                x=cumulative_stratified["Period"],
                 y=cumulative_stratified["Cumulative Target"],
                 mode="lines",
                 name="Cumulative Target",
@@ -1561,14 +1601,15 @@ def main():
             fig_cum.update_layout(
                 height=380,
                 margin=dict(l=20, r=20, t=30, b=20),
-                xaxis_title="Week",
+                xaxis_title=period_word,
+                xaxis_type=x_axis_type,
                 yaxis_title="Cumulative Enrolled",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             )
             st.plotly_chart(fig_cum, use_container_width=True)
 
             latest = cumulative_stratified.iloc[-1]
-            gap = int(latest["Cumulative Target"] - latest["Cumulative Enrolled"])
+            gap = int(round(latest["Cumulative Target"] - latest["Cumulative Enrolled"]))
             if gap > 0:
                 gap_text = f"{gap} behind target"
             elif gap < 0:
@@ -1576,19 +1617,19 @@ def main():
             else:
                 gap_text = "on target"
             st.caption(
-                f"Latest week: {int(latest['Cumulative Enrolled'])} achieved vs "
-                f"{int(latest['Cumulative Target'])} targeted ({gap_text})."
+                f"Latest {period_word.lower()}: {int(latest['Cumulative Enrolled'])} achieved vs "
+                f"{int(round(latest['Cumulative Target']))} targeted ({gap_text})."
             )
         else:
             st.info("No stratification date data available yet.")
 
         st.markdown("---")
 
-        st.subheader("Enrollments by Week")
+        st.subheader(f"Enrollments by {period_word}")
         if not weekly_enrollment.empty:
             fig_weekly = px.bar(
                 weekly_enrollment,
-                x="Week",
+                x="Period",
                 y="Enrollments",
                 text="Enrollments",
                 height=340,
@@ -1597,16 +1638,35 @@ def main():
                 marker_color=rocket_colors(len(weekly_enrollment)),
                 textposition="outside",
             )
-            fig_weekly.add_hline(
-                y=WEEKLY_ENROLLMENT_TARGET,
-                line_dash="dash",
-                line_width=2,
-                line_color="#e63946",
-                annotation_text=f"Target: {WEEKLY_ENROLLMENT_TARGET}/week",
-                annotation_position="top left",
-                annotation_font_color="#e63946",
+            if enroll_view_by == "Weekly":
+                fig_weekly.add_hline(
+                    y=WEEKLY_ENROLLMENT_TARGET,
+                    line_dash="dash",
+                    line_width=2,
+                    line_color="#e63946",
+                    annotation_text=f"Target: {WEEKLY_ENROLLMENT_TARGET}/week",
+                    annotation_position="top left",
+                    annotation_font_color="#e63946",
+                )
+            else:
+                # Months differ in length, so the target is a per-month line.
+                fig_weekly.add_trace(go.Scatter(
+                    x=weekly_enrollment["Period"],
+                    y=weekly_enrollment["Target"],
+                    mode="lines",
+                    name="Target",
+                    line=dict(color="#e63946", width=2, dash="dash"),
+                    hovertemplate="Target: %{y:.1f}<extra></extra>",
+                ))
+                fig_weekly.update_layout(
+                    showlegend=True,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+            fig_weekly.update_layout(
+                margin=dict(l=20, r=20, t=30, b=20),
+                xaxis_title=period_word,
+                xaxis_type=x_axis_type,
             )
-            fig_weekly.update_layout(margin=dict(l=20, r=20, t=30, b=20))
             st.plotly_chart(fig_weekly, use_container_width=True)
         else:
             st.info("No enrollment date data available yet.")
