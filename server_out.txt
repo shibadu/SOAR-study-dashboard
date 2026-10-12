@@ -1,0 +1,82 @@
+Connecting to 41.90.235.66
+depth=0 CN=redcap.cihebkenya.org
+verify error:num=20:unable to get local issuer certificate
+verify return:1
+depth=0 CN=redcap.cihebkenya.org
+verify error:num=21:unable to verify the first certificate
+verify return:1
+depth=0 CN=redcap.cihebkenya.org
+verify return:1
+CONNECTED(00000005)
+---
+Certificate chain
+ 0 s:CN=redcap.cihebkenya.org
+   i:C=US, O=GoDaddy.com, CN=GoDaddy TLS Intermediate CA DV - R1v1
+   a:PKEY: RSA, 2048 (bit); sigalg: sha256WithRSAEncryption
+   v:NotBefore: Sep 10 09:16:25 2026 GMT; NotAfter: Mar 27 09:16:25 2027 GMT
+-----BEGIN CERTIFICATE-----
+MIIHVDCCBTygAwIBAgIJAJxp9hUqAX8qMA0GCSqGSIb3DQEBCwUAMFMxCzAJBgNV
+BAYTAlVTMRQwEgYDVQQKEwtHb0RhZGR5LmNvbTEuMCwGA1UEAxMlR29EYWRkeSBU
+TFMgSW50ZXJtZWRpYXRlIENBIERWIC0gUjF2MTAeFw0yNjA5MTAwOTE2MjVaFw0y
+NzAzMjcwOTE2MjVaMCAxHjAcBgNVBAMTFXJlZGNhcC5jaWhlYmtlbnlhLm9yZzCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALc3jBbeDH2dMS0sC60bWJze
+neQGSG3Feq8tSYIVU69Ly6F3KsoSMVroYP6USHVuUq2amM7TNM2c4H+ynwyc4pN3
+V/C/tOPVWjDDDvpBWtlFg3W7h6aPGD6DoewV3MKmPgLieXmBvzQUk7PfjvhU5c9w
+DdCcCfd0eIpkDePPM6267yQD4c9qxQcL4+8T110MpY+0duvH0VW6rxw71TnMv8Zf
+D3Qah7xU36kzdKOCZaKv3VjqkueI9dwAZLl2xnWnx6CyKseEma9//oW0dmonblJu
+fR4PJWVWK6O3U3R7hfuUJaHrf3bdeBPKqqH7lbUgMJ6vFoJcDQgQFq42dAx19pMC
+AwEAAaOCA1wwggNYMAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYBBQUHAwEw
+DgYDVR0PAQH/BAQDAgWgMDoGA1UdHwQzMDEwL6AtoCuGKWh0dHA6Ly9jcmwuZ29k
+YWRkeS5jb20vZ2RyMXYxZHZfczEtMTUuY3JsMF0GA1UdIARWMFQwCAYGZ4EMAQIB
+MEgGC2CGSAGG/W0BBxcBMDkwNwYIKwYBBQUHAgEWK2h0dHA6Ly9jZXJ0aWZpY2F0
+ZXMuZ29kYWRkeS5jb20vcmVwb3NpdG9yeS8wgYcGCCsGAQUFBwEBBHsweTBRBggr
+BgEFBQcwAoZFaHR0cDovL2NlcnRpZmljYXRlcy5nb2RhZGR5LmNvbS9yZXBvc2l0
+b3J5L2dkX3Rsc19pc3N1aW5nX2R2LXIxdjEuY3J0MCQGCCsGAQUFBzABhhhodHRw
+Oi8vb2NzcC5nb2RhZGR5LmNvbS8wHwYDVR0jBBgwFoAUievnHXnDvts/3I4gsPvk
+Hnw59iswOwYDVR0RBDQwMoIVcmVkY2FwLmNpaGVia2VueWEub3Jnghl3d3cucmVk
+Y2FwLmNpaGVia2VueWEub3JnMB0GA1UdDgQWBBS8K8biRVawQHWASng1XvDjhBfE
+lTCCAX8GCisGAQQB1nkCBAIEggFvBIIBawFpAHcA1tWNqdAXU/NqSqDHV0kCr+vH
+3CzTjNn3ZMgMiRkenwIAAAGgipqoXAAABAMASDBGAiEAgumUTxaxw2PufsQq+9SU
+x2ufIoD2Ro5hyPXd/YLfy7cCIQCHWH7eVa+YgxuPCjkTyqIBXwBsTWQz6V4DIXew
+ixINoAB3AGBMmq96f3dfAdQG/JINyJnrCxx9+MlSG/r6F3c7l4vJAAABoIqaqocA
+AAQDAEgwRgIhAIdkVoVjMdB66rbtGeH41oyHyrTtfnhpnKBTpsoSxtvxAiEA9YtX
+rZOp7EkWyhQjdJYYlRxh7bZ/go6NxfZIhMyoLYIAdQBMY9yY5Zwdq4j2Hoo93q6P
+q0SjN3tfm5TD+6Gc/MG+JgAAAaCKmquZAAAEAwBGMEQCICDCkZdkhatKFYbwMfPZ
+T9Isg57cOrK1/zqVnFUUZhqOAiBYjt7Q5ZjZzNyPiUOjoZD4cS/vcn1oup2pAP8o
+sMpR/DANBgkqhkiG9w0BAQsFAAOCAgEAjJIYJbqQx37u2OK0w974U0SdL7wwUf9j
+duvQrWGtuPWIbhWYhLy0TrYJJ6vy9RIqx4RJXBZKJWSAqUNa0rnNCgfAU+ATEjSZ
+FmlqnRETpVK2mpBrq0+x0TY5QSeYSiU7TWlwoj5X5zkteZk3znBx15ndrrC/tJy/
+3rnSWYOCiODrBoahhO4sQ8Twvz5B3dCvsQAnEiYLeU41prOuQYGugRvhY2LJEVlA
+UyYFMXg7XtmTaG63dNGv534dt7Lagjk02rfzquaw5KVswvm2Il2tw0YZXXXoHKK9
+5/njeat6cRlC9dWMXCkB1LkbNcp7wKpdt0A6vibqNWm2lN3wuKKi5vMNsBeG+N1/
+kBUPbCse3WsBCGb7zj/lRNktDrqu/Ej62jwhoCvpQGkOozV4vTI2YhQjQC4KIMWO
+jM2nz/Z609ztk60LJkQenJ1we48tn7eeFOrzZoLnbPMXEqh/t6bp7ut6jBm1vDBd
+DvzUPmrVLvJmCnhadMv1T+sGBhQlql1QNWE3Hz18XjYidrZ05Jzo8yF+JC/BmJVM
+mPoB2IqOc1GdlDWosQFbgioIuj+sHX7Jpnf3t2JeDkRVyc0G6gD23YNFq3OMWh4g
+L4HxnidYYaq0oA8c1AWSI2Fxl8JsDw5h1K2LULRRHCC6dCCtkSP7n6Ex188MtyCb
+WVio9L5zOGw=
+-----END CERTIFICATE-----
+---
+Server certificate
+subject=CN=redcap.cihebkenya.org
+issuer=C=US, O=GoDaddy.com, CN=GoDaddy TLS Intermediate CA DV - R1v1
+---
+No client certificate CA names sent
+Peer signing digest: SHA256
+Peer signature type: rsa_pss_rsae_sha256
+Peer Temp Key: X25519, 253 bits
+---
+SSL handshake has read 2440 bytes and written 1632 bytes
+Verification error: unable to verify the first certificate
+---
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+Protocol: TLSv1.3
+Server public key is 2048 bit
+This TLS version forbids renegotiation.
+Compression: NONE
+Expansion: NONE
+No ALPN negotiated
+Early data was not sent
+Verify return code: 21 (unable to verify the first certificate)
+---
+DONE

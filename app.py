@@ -242,8 +242,30 @@ def connect_redcap():
     if not api_url or not api_token:
         return None
 
+    # Optional CA bundle for servers that don't send the full certificate
+    # chain (e.g. missing GoDaddy intermediate). Resolution order:
+    #   1. REDCAP_CA_BUNDLE env var / Streamlit secret
+    #   2. redcap_ca_bundle.pem sitting next to app.py
+    #   3. default system/certifi trust store
+    # Once the server serves the full chain, remove the bundle and this
+    # falls back to normal verification. Never disable verification: this
+    # connection carries the API token and participant-level data.
+    ca_bundle = os.getenv("REDCAP_CA_BUNDLE", "")
+    if not ca_bundle:
+        try:
+            ca_bundle = st.secrets.get("REDCAP_CA_BUNDLE", "")
+        except Exception:
+            pass
+    if not ca_bundle:
+        local_bundle = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redcap_ca_bundle.pem")
+        if os.path.isfile(local_bundle):
+            ca_bundle = local_bundle
+
     try:
-        proj = Project(api_url, api_token)
+        if ca_bundle:
+            proj = Project(api_url, api_token, verify_ssl=ca_bundle)
+        else:
+            proj = Project(api_url, api_token)
         return proj
     except Exception as e:
         st.error(f"Failed to connect to REDCap: {e}")
