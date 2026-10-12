@@ -143,15 +143,8 @@ AGE_GROUP_BINS = [17, 30, 40, 50, 60, float("inf")]
 BEHAVIORAL_INTERVENTION_FIELD = "bt_intervention_type"
 BEHAVIORAL_INTERVENTION_MAP = {"1": "PSF", "2": "BA", "PSF": "PSF", "BA": "BA"}
 
-# PSF follow-up session completion fields, from the behavioral_tracking form
-# (data dictionary rows bt_psf_s1_status ... bt_psf_s8_status). Each is
-# coded 1 = Done, 0 = Not Done, and only populated when
-# bt_intervention_type = 1 (PSF).
 PSF_SESSION_STATUS_FIELDS = [f"bt_psf_s{i}_status" for i in range(1, 9)]
-# Days after Day 0 (medication/intervention date) at which each PSF session
-# falls due, Session 1..8. NOTE: Session 4 was given as "+ 4" in the request;
-# +22 is assumed here (the schedule is otherwise 14 days apart from Session 5
-# onward). Change this one number if the protocol says otherwise.
+
 PSF_SESSION_DAY_OFFSETS = [0, 8, 15, 22, 36, 50, 64, 78]
 
 # Field holding Day 0 (medication/intervention date), tried in order.
@@ -1531,8 +1524,8 @@ def main():
             st.warning(started_med_warning)
         elif started_med_field:
             st.caption(
-                f"Started Medication = participants with a date in '{started_med_field}' "
-                "on the Day 0 visit log."
+                f"Started Medication = participants who honored "
+                f"Day 0 visit."
             )
 
         st.markdown("---")
