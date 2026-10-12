@@ -101,7 +101,32 @@ AGE_FIELD_CANDIDATES = ["prescreen_age", "age", "participant_age"]
 SEX_FIELD_CANDIDATES = ["gender", "sex", "participant_sex"]
 SEX_MAP = {"1": "Male", "2": "Female"}
 
-VISIT_WINDOW_ORDER = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
+VISIT_WINDOW_ORDER = ["Day 0", "Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
+# Follow-up windows only (Day 0 is the medication-start visit, not a follow-up),
+# used for the retention table.
+FOLLOWUP_WINDOWS = [w for w in VISIT_WINDOW_ORDER if w != "Day 0"]
+
+# visit_log.visit_window coding. ASSUMPTION: Day 0 was added as code "0" and
+# the existing codes 1-5 were left unchanged. If the data dictionary recoded
+# the field (e.g. Day 0 = 1, Week 1 = 2, ...), change this one map. Label text
+# is also accepted so a labelled export works too.
+VISIT_WINDOW_CODE_MAP = {
+    "0": "Day 0",
+    "1": "Week 1",
+    "2": "Week 2",
+    "3": "Week 3",
+    "4": "Week 12",
+    "5": "Week 36",
+    **{w: w for w in VISIT_WINDOW_ORDER},
+}
+
+# Date field on the visit_log form, tried in order. A Day 0 visit-log row with
+# a date in this field = participant started medication. If none of these
+# exist, any visit-related *date* column in the visit data is auto-detected.
+VISIT_DATE_FIELD_CANDIDATES = [
+    "visit_date", "vl_visit_date", "visit_log_date", "actual_visit_date",
+    "visit_actual_date", "date_of_visit",
+]
 
 # Target rate of stratified (randomized) enrollment, used both for the
 # "Enrollments by Week" reference line and the "Cumulative Enrollments"
@@ -783,16 +808,8 @@ def build_visit_matrix(df_visits):
     if df_visits.empty or "visit_window" not in df_visits.columns:
         return pd.DataFrame()
 
-    visit_map = {
-        "1": "Week 1",
-        "2": "Week 2",
-        "3": "Week 3",
-        "4": "Week 12",
-        "5": "Week 36",
-    }
-
     df = df_visits.copy()
-    df["visit_label"] = df["visit_window"].astype(str).map(visit_map)
+    df["visit_label"] = df["visit_window"].astype(str).str.strip().map(VISIT_WINDOW_CODE_MAP)
     df = df[df["visit_label"].notna()]
 
     id_col = "record_id" if "record_id" in df.columns else df.columns[0]
@@ -874,16 +891,9 @@ def get_overdue_visits(df_clinical, df_visits):
     completed = pd.DataFrame()
     if not df_visits.empty and "visit_status" in df_visits.columns:
         completed = df_visits[df_visits["visit_status"] == "1"].copy()
-        visit_window_map = {
-            "1": "Week 1",
-            "2": "Week 2",
-            "3": "Week 3",
-            "4": "Week 12",
-            "5": "Week 36",
-        }
         if "visit_window" in completed.columns:
-            completed["visit_label"] = completed["visit_window"].astype(str).map(
-                visit_window_map
+            completed["visit_label"] = completed["visit_window"].astype(str).str.strip().map(
+                VISIT_WINDOW_CODE_MAP
             )
 
     overdue = []
@@ -933,6 +943,132 @@ def get_overdue_visits(df_clinical, df_visits):
         if overdue
         else pd.DataFrame(overdue)
     )
+
+def count_started_medication(df_visits):
+    """Participants who started medication = unique participants with a date
+    on their Day 0 visit-log row.
+
+    Returns (count, date_field_used, warning).
+    """
+    if df_visits.empty or "visit_window" not in df_visits.columns:
+        return 0, None, "No visit log data available to count medication starts."
+
+    field = next((c for c in VISIT_DATE_FIELD_CANDIDATES if c in df_visits.columns), None)
+    if field is None:
+        field = next(
+            (
+                c for c in df_visits.columns
+                if "date" in c.lower() and "visit" in c.lower()
+                and not any(x in c.lower() for x in ("due", "next", "window"))
+            ),
+            None,
+        )
+    if field is None:
+        return 0, None, (
+            "Could not find the visit date field on the visit log. Set "
+            "VISIT_DATE_FIELD_CANDIDATES to its name to count medication starts."
+        )
+
+    id_col = "record_id" if "record_id" in df_visits.columns else df_visits.columns[0]
+    day0 = df_visits[
+        df_visits["visit_window"].astype(str).str.strip().map(VISIT_WINDOW_CODE_MAP) == "Day 0"
+    ]
+    dated = day0[pd.to_datetime(day0[field], errors="coerce").notna()]
+    return int(dated[id_col].astype(str).nunique()), field, None
+
+
+def get_excluded_participants(df_visits, df_clinical):
+    """Participants to take out of the Action Required lists.
+
+    - Terminated: any visit-log row with visit_status = 4 (Withdrawn/Discontinued).
+    - Missed Day 0: Day 0 visit logged as Missed (status 2) with no Day 0 visit
+      logged as Completed. Anyone already listed as terminated is not repeated.
+    Returns (terminated_df, missed_day0_df).
+    """
+    term_cols = ["Record ID", "Participant ID", "Withdrawn/Discontinued At"]
+    miss_cols = ["Record ID", "Participant ID", "Day 0 Due Date"]
+    empty_t = pd.DataFrame(columns=term_cols)
+    empty_m = pd.DataFrame(columns=miss_cols)
+    if (
+        df_visits.empty
+        or "visit_window" not in df_visits.columns
+        or "visit_status" not in df_visits.columns
+    ):
+        return empty_t, empty_m
+
+    id_col = "record_id" if "record_id" in df_visits.columns else df_visits.columns[0]
+    v = df_visits.copy()
+    v[id_col] = v[id_col].astype(str)
+    v["visit_label"] = v["visit_window"].astype(str).str.strip().map(VISIT_WINDOW_CODE_MAP)
+    v["status"] = v["visit_status"].astype(str).str.strip()
+    v = v[v["visit_label"].notna()]
+
+    study_ids, day0_due = {}, {}
+    if not df_clinical.empty:
+        cid = "record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]
+        c = df_clinical.copy()
+        c[cid] = c[cid].astype(str)
+        if "study_id" in c.columns:
+            sid = c[~_is_blank(c["study_id"])].drop_duplicates(cid)
+            study_ids = sid.set_index(cid)["study_id"].to_dict()
+        if "day_0_due" in c.columns:
+            d = c.assign(_d=pd.to_datetime(c["day_0_due"], errors="coerce"))
+            d = d.dropna(subset=["_d"]).drop_duplicates(cid)
+            day0_due = d.set_index(cid)["_d"].dt.strftime("%Y-%m-%d").to_dict()
+
+    order = {w: i for i, w in enumerate(VISIT_WINDOW_ORDER)}
+    term = v[v["status"] == "4"].copy()
+    term["_o"] = term["visit_label"].map(order)
+    term = term.sort_values("_o").drop_duplicates(id_col)
+    terminated_df = pd.DataFrame(
+        {
+            "Record ID": term[id_col].values,
+            "Participant ID": [study_ids.get(r, "N/A") for r in term[id_col]],
+            "Withdrawn/Discontinued At": term["visit_label"].values,
+        }
+    ) if not term.empty else empty_t
+
+    day0 = v[v["visit_label"] == "Day 0"]
+    completed_ids = set(day0.loc[day0["status"] == "1", id_col])
+    terminated_ids = set(terminated_df["Record ID"])
+    missed_ids = [
+        r for r in day0.loc[day0["status"] == "2", id_col].drop_duplicates()
+        if r not in completed_ids and r not in terminated_ids
+    ]
+    missed_day0_df = pd.DataFrame(
+        {
+            "Record ID": missed_ids,
+            "Participant ID": [study_ids.get(r, "N/A") for r in missed_ids],
+            "Day 0 Due Date": [day0_due.get(r, "") for r in missed_ids],
+        }
+    ) if missed_ids else empty_m
+
+    return terminated_df, missed_day0_df
+
+
+def exclude_records(df, record_ids):
+    """Drop rows whose "Record ID" is in record_ids (no-op on empty input)."""
+    if df.empty or "Record ID" not in df.columns or not record_ids:
+        return df
+    return df[~df["Record ID"].astype(str).isin(record_ids)].reset_index(drop=True)
+
+
+def render_excluded_lists(terminated_df, missed_day0_df):
+    """Show the Terminated and Missed Day 0 lists side by side."""
+    col_t, col_m = st.columns(2)
+    with col_t:
+        st.markdown(f"**{len(terminated_df)} Terminated from Study**")
+        if not terminated_df.empty:
+            st.dataframe(terminated_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No participants terminated from the study.")
+    with col_m:
+        st.markdown(f"**{len(missed_day0_df)} Missed Day 0**")
+        if not missed_day0_df.empty:
+            st.dataframe(missed_day0_df, use_container_width=True, hide_index=True)
+        else:
+            st.success("No participants have missed Day 0.")
+
 
 def build_stratification_summary(df_clinical):
     """Build a stratum-level summary table: counts + % of stratified participants."""
@@ -1148,7 +1284,7 @@ def build_weekly_retention(visit_matrix):
         return pd.DataFrame()
 
     rows = []
-    for week in VISIT_WINDOW_ORDER:
+    for week in FOLLOWUP_WINDOWS:
         if week not in visit_matrix.columns:
             continue
         counts = visit_matrix[week].value_counts()
@@ -1334,6 +1470,29 @@ def main():
     if behavioral_export_error and psf_session_summary.empty:
         psf_session_warning = behavioral_export_error
 
+    # Randomised = PSF + BA (participants with a behavioral intervention assigned).
+    if not psf_ba_distribution.empty:
+        randomised_n = int(psf_ba_distribution["Count"].sum())
+        randomised_note = None
+    else:
+        randomised_n = enrollment["stratified"]
+        randomised_note = (
+            "PSF/BA assignments were unavailable, so Randomised is showing the "
+            "count of participants with an assigned stratum instead."
+        )
+
+    # Started medication = participants with a date on their Day 0 visit log.
+    started_med_n, started_med_field, started_med_warning = count_started_medication(df_visits)
+
+    # Action Required: terminated and missed-Day-0 participants are listed
+    # separately and removed from the overdue/upcoming lists.
+    terminated_df, missed_day0_df = get_excluded_participants(df_visits, df_clinical)
+    excluded_ids = set(terminated_df["Record ID"].astype(str)) | set(
+        missed_day0_df["Record ID"].astype(str)
+    )
+    overdue = exclude_records(overdue, excluded_ids)
+    upcoming = exclude_records(upcoming, excluded_ids)
+
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
     # ═══════════════════════════════════════════════════════════
@@ -1347,7 +1506,7 @@ def main():
             unsafe_allow_html=True,
         )
 
-        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+        kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
         kpi1.metric("Pre-Screened", enrollment["total_screened"])
         kpi2.metric(
             "Met Preliminary Eligibility criteria",
@@ -1360,7 +1519,21 @@ def main():
             f"{enrollment['consented'] / max(enrollment['eligible_referred'], 1) * 100:.0f}%",
         )
         kpi4.metric("Eligible", enrollment["clinically_eligible"])
-        kpi5.metric("Randomised", enrollment["stratified"])
+        kpi5.metric("Randomised", randomised_n)
+        kpi6.metric(
+            "Started Medication",
+            started_med_n,
+            f"{started_med_n / max(randomised_n, 1) * 100:.0f}% of randomised",
+        )
+        if randomised_note:
+            st.caption(randomised_note)
+        if started_med_warning:
+            st.warning(started_med_warning)
+        elif started_med_field:
+            st.caption(
+                f"Started Medication = participants with a date in '{started_med_field}' "
+                "on the Day 0 visit log."
+            )
 
         st.markdown("---")
 
@@ -1373,13 +1546,15 @@ def main():
                     "Consented",
                     "Eligible",
                     "Randomised",
+                    "Started Medication",
                 ],
                 "Count": [
                     enrollment["total_screened"],
                     enrollment["eligible_referred"],
                     enrollment["consented"],
                     enrollment["clinically_eligible"],
-                    enrollment["stratified"],
+                    randomised_n,
+                    started_med_n,
                 ],
             }
         )
@@ -1714,6 +1889,12 @@ def main():
             else:
                 st.info("No visits scheduled in the next 7 days.")
 
+        st.caption(
+            "Terminated and Missed Day 0 participants are excluded from the "
+            "lists above and shown separately below."
+        )
+        render_excluded_lists(terminated_df, missed_day0_df)
+
     # ═══════════════════════════════════════════════════════════
     # VIEW: VISIT MATRIX
     # ═══════════════════════════════════════════════════════════
@@ -1848,8 +2029,13 @@ def main():
             unsafe_allow_html=True,
         )
 
-        tab1, tab2, tab3 = st.tabs(
-            ["Overdue Visits", "Upcoming Visits", "Adverse Events"]
+        tab1, tab2, tab3, tab4 = st.tabs(
+            [
+                "Overdue Visits",
+                "Upcoming Visits",
+                "Adverse Events",
+                "Terminated / Missed Day 0",
+            ]
         )
 
         with tab1:
@@ -1939,6 +2125,13 @@ def main():
                         )
                     else:
                         st.info("No outcome data available for recorded AEs.")
+
+        with tab4:
+            st.caption(
+                "These participants are excluded from the Overdue and "
+                "Upcoming lists."
+            )
+            render_excluded_lists(terminated_df, missed_day0_df)
 
 if __name__ == "__main__":
     main()
