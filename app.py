@@ -1489,7 +1489,7 @@ def main():
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
     # ═══════════════════════════════════════════════════════════
-    if view_mode == "Dashboard":
+    if view_mode == "Study Overview":
         st.markdown(
             '<div class="main-header">SOAR Study Enrollment & Follow-up Dashboard</div>',
             unsafe_allow_html=True,
@@ -2016,7 +2016,7 @@ def main():
     # ═══════════════════════════════════════════════════════════
     # VIEW: ALERTS
     # ═══════════════════════════════════════════════════════════
-    elif view_mode == "Alerts":
+    elif view_mode == "Alerts - AE/Safety":
         st.markdown(
             '<div class="main-header">Alerts</div>',
             unsafe_allow_html=True,
