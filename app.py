@@ -1356,9 +1356,9 @@ def main():
         view_mode = st.radio(
             "Select View",
             [
-                "Dashboard",
+                "Study Overview",
                 "Visit Matrix",
-                "Alerts",
+                "Alerts - AE/Safety",
             ],
             index=0,
         )
@@ -1578,7 +1578,7 @@ def main():
                     names="Group",
                     values="Count",
                     title=f"Number Assigned (N={total_assigned})",
-                    height=320,
+                    height=318,
                     color_discrete_sequence=rocket_colors(len(psf_ba_distribution)),
                 )
                 fig_psf_ba.update_traces(
