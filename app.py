@@ -128,6 +128,15 @@ VISIT_DATE_FIELD_CANDIDATES = [
     "visit_actual_date", "date_of_visit",
 ]
 
+# Screening date field (pre_screening form), tried in order. ASSUMPTION: the
+# exact name isn't in this file, so if none of these exist the Enrollments view
+# auto-detects a "screen*date" column and lets you pick another from a dropdown.
+SCREENING_DATE_FIELD_CANDIDATES = [
+    "prescreen_date", "prescreening_date", "pre_screening_date",
+    "screening_date", "screen_date", "date_screened", "prescreen_visit_date",
+    "ps_date",
+]
+
 # Target rate of stratified (randomized) enrollment, used both for the
 # "Enrollments by Week" reference line and the "Cumulative Enrollments"
 # target line.
@@ -937,14 +946,13 @@ def get_overdue_visits(df_clinical, df_visits):
         else pd.DataFrame(overdue)
     )
 
-def count_started_medication(df_visits):
-    """Participants who started medication = unique participants with a date
-    on their Day 0 visit-log row.
+def _started_medication_rows(df_visits):
+    """Day 0 visit-log rows that carry a date (= medication started).
 
-    Returns (count, date_field_used, warning).
+    Returns (dated_rows_df, id_col, date_field_used, warning).
     """
     if df_visits.empty or "visit_window" not in df_visits.columns:
-        return 0, None, "No visit log data available to count medication starts."
+        return None, None, None, "No visit log data available to count medication starts."
 
     field = next((c for c in VISIT_DATE_FIELD_CANDIDATES if c in df_visits.columns), None)
     if field is None:
@@ -957,7 +965,7 @@ def count_started_medication(df_visits):
             None,
         )
     if field is None:
-        return 0, None, (
+        return None, None, None, (
             "Could not find the visit date field on the visit log. Set "
             "VISIT_DATE_FIELD_CANDIDATES to its name to count medication starts."
         )
@@ -967,7 +975,27 @@ def count_started_medication(df_visits):
         df_visits["visit_window"].astype(str).str.strip().map(VISIT_WINDOW_CODE_MAP) == "Day 0"
     ]
     dated = day0[pd.to_datetime(day0[field], errors="coerce").notna()]
+    return dated, id_col, field, None
+
+
+def count_started_medication(df_visits):
+    """Participants who started medication = unique participants with a date
+    on their Day 0 visit-log row.
+
+    Returns (count, date_field_used, warning).
+    """
+    dated, id_col, field, warning = _started_medication_rows(df_visits)
+    if warning:
+        return 0, None, warning
     return int(dated[id_col].astype(str).nunique()), field, None
+
+
+def get_started_medication_ids(df_visits):
+    """Set of record IDs (as str) that started medication (same rule as above)."""
+    dated, id_col, _, warning = _started_medication_rows(df_visits)
+    if warning:
+        return set()
+    return set(dated[id_col].astype(str).str.strip())
 
 
 def get_excluded_participants(df_visits, df_clinical):
@@ -1334,6 +1362,125 @@ def get_safety_screening_summary(df_clinical):
 # ───────────────────────────────────────────────────────────────
 # SHAREABLE REPORT GENERATOR
 # ───────────────────────────────────────────────────────────────
+def detect_screening_date_field(df_all):
+    """Best-guess screening-date column in the REDCap export (or None)."""
+    if df_all is None or df_all.empty:
+        return None
+    field = next((c for c in SCREENING_DATE_FIELD_CANDIDATES if c in df_all.columns), None)
+    if field:
+        return field
+    return next(
+        (
+            c for c in df_all.columns
+            if "screen" in c.lower() and "date" in c.lower()
+            and not any(x in c.lower() for x in ("due", "next", "window"))
+        ),
+        None,
+    )
+
+
+def get_eligible_ids(df_clinical):
+    """Record IDs (str) with ce_enrollment_decision == 1 (the 'Eligible' KPI)."""
+    if df_clinical.empty or "ce_enrollment_decision" not in df_clinical.columns:
+        return set()
+    id_col = "record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]
+    rows = df_clinical[df_clinical["ce_enrollment_decision"] == "1"]
+    return set(rows[id_col].astype(str).str.strip())
+
+
+def get_randomised_ids(df_behavioral, df_clinical):
+    """Record IDs (str) that are randomised, matching the 'Randomised' KPI.
+
+    Primary rule: a valid PSF/BA behavioral intervention is assigned. If that
+    form is unavailable, fall back to participants with an assigned stratum.
+    """
+    if (
+        not df_behavioral.empty
+        and BEHAVIORAL_INTERVENTION_FIELD in df_behavioral.columns
+    ):
+        id_col = "record_id" if "record_id" in df_behavioral.columns else df_behavioral.columns[0]
+        labels = (
+            df_behavioral[BEHAVIORAL_INTERVENTION_FIELD]
+            .astype(str).str.strip().str.upper()
+            .map(BEHAVIORAL_INTERVENTION_MAP)
+        )
+        ids = set(df_behavioral.loc[labels.notna(), id_col].astype(str).str.strip())
+        if ids:
+            return ids
+    if not df_clinical.empty and "ce_assigned_strata" in df_clinical.columns:
+        id_col = "record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]
+        rows = df_clinical[
+            df_clinical["ce_assigned_strata"].notna()
+            & (df_clinical["ce_assigned_strata"] != "")
+        ]
+        return set(rows[id_col].astype(str).str.strip())
+    return set()
+
+
+def build_enrollment_by_month(df_all, date_field, eligible_ids, randomised_ids, started_ids):
+    """Eligible / Randomised / Started Medication counts by SCREENING month.
+
+    Each participant is placed in the month of their (earliest) screening date
+    and counted once per stage, so a participant screened in March who starts
+    medication in May counts under March for every stage.
+
+    Returns (monthly_df, participants_df, n_undated):
+      monthly_df      one row per calendar month from first to last screening
+                      month (zero-filled), columns: Month, Eligible,
+                      Randomised, Started Medication
+      participants_df one row per screened participant with stage flags
+      n_undated       participants in any stage with no screening date (these
+                      cannot be placed in a month and are left out of monthly_df)
+    """
+    empty_monthly = pd.DataFrame(
+        columns=["Month", "Eligible", "Randomised", "Started Medication"]
+    )
+    if df_all.empty or date_field not in df_all.columns:
+        return empty_monthly, pd.DataFrame(), 0
+
+    id_col = "record_id" if "record_id" in df_all.columns else df_all.columns[0]
+    d = df_all[[id_col, date_field]].copy()
+    d[id_col] = d[id_col].astype(str).str.strip()
+    d["_d"] = pd.to_datetime(d[date_field], errors="coerce")
+    d = d.dropna(subset=["_d"])
+    screen_dates = d.groupby(id_col)["_d"].min()
+
+    staged_ids = set(eligible_ids) | set(randomised_ids) | set(started_ids)
+    n_undated = len(staged_ids - set(screen_dates.index))
+
+    if screen_dates.empty:
+        return empty_monthly, pd.DataFrame(), n_undated
+
+    participants = pd.DataFrame({"Record ID": screen_dates.index})
+    participants["Screening Date"] = screen_dates.dt.strftime("%Y-%m-%d").values
+    participants["_month"] = screen_dates.dt.to_period("M").dt.start_time.values
+    participants["Eligible"] = participants["Record ID"].isin(eligible_ids).astype(int)
+    participants["Randomised"] = participants["Record ID"].isin(randomised_ids).astype(int)
+    participants["Started Medication"] = participants["Record ID"].isin(started_ids).astype(int)
+
+    months = pd.date_range(participants["_month"].min(), participants["_month"].max(), freq="MS")
+    monthly = (
+        participants.groupby("_month")[["Eligible", "Randomised", "Started Medication"]]
+        .sum()
+        .reindex(months, fill_value=0)
+        .astype(int)
+    )
+    monthly.insert(0, "Month", monthly.index.strftime("%b %Y"))
+    monthly = monthly.reset_index(drop=True)
+
+    participants["Screening Month"] = pd.to_datetime(participants["_month"]).dt.strftime("%Y-%m")
+    participants = (
+        participants.drop(columns="_month")
+        .sort_values(["Screening Date", "Record ID"])
+        .reset_index(drop=True)
+    )
+    participants = participants[
+        ["Record ID", "Screening Date", "Screening Month",
+         "Eligible", "Randomised", "Started Medication"]
+    ]
+    return monthly, participants, n_undated
+
+
 def generate_shareable_link(view_mode, filters=None):
     """Encode current view state into query parameters for sharing."""
     params = {"view": view_mode}
@@ -1357,6 +1504,7 @@ def main():
             "Select View",
             [
                 "Study Overview",
+                "Enrollments",
                 "Visit Matrix",
                 "Alerts - AE/Safety",
             ],
@@ -2012,6 +2160,132 @@ def main():
                 st.info("No PSF session data available yet.")
         else:
             st.info("No visit data to display.")
+
+    # ═══════════════════════════════════════════════════════════
+    # VIEW: ENROLLMENTS (by screening month)
+    # ═══════════════════════════════════════════════════════════
+    elif view_mode == "Enrollments":
+        st.markdown(
+            '<div class="main-header">Enrollments by Month</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="sub-header">Participants grouped by the month they were '
+            "screened</div>",
+            unsafe_allow_html=True,
+        )
+
+        date_cols = sorted(c for c in df_all.columns if "date" in c.lower())
+        detected_field = detect_screening_date_field(df_all)
+        if not date_cols:
+            st.warning("No date fields were returned by REDCap, so enrollments "
+                       "can't be grouped by month.")
+            st.stop()
+
+        options = date_cols if detected_field else ["Select a date field"] + date_cols
+        default_idx = options.index(detected_field) if detected_field else 0
+        screening_field = st.selectbox(
+            "Screening date field",
+            options,
+            index=default_idx,
+            help="Participants are placed in the month of this date (earliest "
+                 "value per participant).",
+        )
+        if screening_field not in df_all.columns:
+            st.info(
+                "Pick the screening date field above. To make this permanent, "
+                "add its name to SCREENING_DATE_FIELD_CANDIDATES."
+            )
+            st.stop()
+
+        eligible_ids = get_eligible_ids(df_clinical)
+        randomised_ids = get_randomised_ids(df_behavioral, df_clinical)
+        started_ids = get_started_medication_ids(df_visits)
+
+        monthly, enroll_participants, n_undated = build_enrollment_by_month(
+            df_all, screening_field, eligible_ids, randomised_ids, started_ids
+        )
+
+        if monthly.empty:
+            st.info(
+                f"No valid dates found in '{screening_field}'. Check that it is "
+                "the right field."
+            )
+        else:
+            totals = monthly[["Eligible", "Randomised", "Started Medication"]].sum()
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Eligible", int(totals["Eligible"]))
+            k2.metric("Randomised", int(totals["Randomised"]))
+            k3.metric(
+                "Started Medication",
+                int(totals["Started Medication"]),
+                f"{totals['Started Medication'] / max(totals['Randomised'], 1) * 100:.0f}% of randomised",
+            )
+            st.caption(
+                f"Grouped by screening date ({screening_field}). Each participant "
+                "counts once, in their screening month, even if randomisation or "
+                "Day 0 happened later."
+            )
+            if n_undated:
+                st.warning(
+                    f"{n_undated} participant(s) at these stages have no screening "
+                    "date and are not shown in the monthly counts."
+                )
+
+            st.markdown("---")
+
+            stage_colors = {
+                "Eligible": "#2980b9",
+                "Randomised": "#2e7d32",
+                "Started Medication": "#f39c12",
+            }
+            fig_enroll = go.Figure()
+            for stage, color in stage_colors.items():
+                fig_enroll.add_trace(go.Bar(
+                    x=monthly["Month"],
+                    y=monthly[stage],
+                    name=stage,
+                    marker_color=color,
+                    text=monthly[stage],
+                    textposition="outside",
+                ))
+            fig_enroll.update_layout(
+                barmode="group",
+                height=420,
+                margin=dict(l=20, r=20, t=30, b=20),
+                xaxis=dict(title="Screening month", type="category"),
+                yaxis=dict(title="Participants"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            )
+            st.plotly_chart(fig_enroll, use_container_width=True)
+
+            total_row = pd.DataFrame([{
+                "Month": "Total",
+                "Eligible": int(totals["Eligible"]),
+                "Randomised": int(totals["Randomised"]),
+                "Started Medication": int(totals["Started Medication"]),
+            }])
+            report_df = pd.concat([monthly, total_row], ignore_index=True)
+            st.dataframe(report_df, use_container_width=True, hide_index=True)
+
+            dl1, dl2 = st.columns(2)
+            stamp = datetime.now().strftime("%Y%m%d")
+            with dl1:
+                st.download_button(
+                    "Download monthly report (CSV)",
+                    report_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"soar_enrollment_by_screening_month_{stamp}.csv",
+                    mime="text/csv",
+                )
+            with dl2:
+                st.download_button(
+                    "Download participant-level list (CSV)",
+                    enroll_participants.to_csv(index=False).encode("utf-8"),
+                    file_name=f"soar_enrollment_participants_{stamp}.csv",
+                    mime="text/csv",
+                    help="One row per screened participant with their screening "
+                         "month and stage flags (1 = reached stage).",
+                )
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: ALERTS
