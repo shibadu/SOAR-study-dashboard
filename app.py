@@ -1390,15 +1390,19 @@ def build_medication_retention(df_all, df_visits):
     Weekly rows: Due = initiated and due date <= today; Attended = of those,
     honored that week's visit.
 
-    Returns (summary_dict, weekly_df, warning).
+    Returns (summary_dict, weekly_df, not_retained_df, warning), where
+    not_retained_df lists each participant who was due for a week but did not
+    attend it (columns: Participant ID, Record ID, Visit type).
     """
+    nr_cols = ["Participant ID", "Record ID", "Visit type"]
+    empty_nr = pd.DataFrame(columns=nr_cols)
     weekly_cols = ["Week", "Due", "Attended", "Retention %"]
     empty_weekly = pd.DataFrame(columns=weekly_cols)
     empty = {"initiated": 0, "retained": 0, "pct": None, "due_fields_found": False}
 
     dated, id_col, field, warning = _started_medication_rows(df_visits)
     if warning:
-        return empty, empty_weekly, warning
+        return empty, empty_weekly, empty_nr, warning
 
     d0 = dated[[id_col, field]].copy()
     d0[id_col] = d0[id_col].astype(str).str.strip()
@@ -1406,7 +1410,7 @@ def build_medication_retention(df_all, df_visits):
     day0 = d0.groupby(id_col)["_d"].min()
     started_ids = day0.index
     if len(started_ids) == 0:
-        return empty, empty_weekly, "No participants have started medication yet."
+        return empty, empty_weekly, empty_nr, "No participants have started medication yet."
 
     # Honored matrix (participant x week)
     v = df_visits.copy()
@@ -1471,7 +1475,25 @@ def build_medication_retention(df_all, df_visits):
         "pct": n_ret / initiated * 100 if initiated else None,
         "due_fields_found": due_fields_found,
     }
-    return summary, pd.DataFrame(rows, columns=weekly_cols), None
+
+    # Participants due for a week but not attended, one row per week missed.
+    study_ids = {}
+    if "study_id" in df_all.columns:
+        sid = df_all[[all_id, "study_id"]].copy()
+        sid[all_id] = sid[all_id].astype(str).str.strip()
+        sid = sid[~_is_blank(sid["study_id"])].drop_duplicates(all_id)
+        study_ids = sid.set_index(all_id)["study_id"].to_dict()
+    nr_rows = []
+    for w in MED_FOLLOWUP_WINDOWS:
+        for rid in is_due.index[(is_due[w] & ~honored[w]).values]:
+            nr_rows.append({
+                "Participant ID": study_ids.get(rid, "N/A"),
+                "Record ID": rid,
+                "Visit type": w,
+            })
+    not_retained = pd.DataFrame(nr_rows, columns=nr_cols)
+
+    return summary, pd.DataFrame(rows, columns=weekly_cols), not_retained, None
 
 
 def build_psf_retention(df_behavioral, day0_dates=None):
@@ -1849,7 +1871,7 @@ def main():
         )
 
     # Retention (medication visits + behavioral PSF)
-    med_retention, med_weekly_retention, med_retention_warning = build_medication_retention(
+    med_retention, med_weekly_retention, med_not_retained, med_retention_warning = build_medication_retention(
         df_all, df_visits
     )
     psf_retention, psf_retention_warning = build_psf_retention(df_behavioral, day0_dates)
@@ -2017,127 +2039,6 @@ def main():
                 show_plot(fig_strata, use_container_width=True)
         else:
             st.info("No stratification data available yet.")
-
-        st.markdown("---")
-
-        st.subheader("Retention")
-        ret_left, ret_right = st.columns([1, 2])
-
-        with ret_left:
-            st.markdown("**Overall Retention**")
-            if med_retention_warning:
-                st.warning(med_retention_warning)
-            elif med_retention["initiated"] > 0:
-                st.metric(
-                    "Retained (Medication visit)",
-                    f"{med_retention['pct']:.0f}%",
-                    f"{med_retention['retained']} of {med_retention['initiated']} initiated",
-                    delta_color="off",
-                )
-            else:
-                st.info("No participants have started medication yet.")
-
-            if psf_retention_warning:
-                st.warning(psf_retention_warning)
-            elif psf_retention["randomised"] > 0:
-                st.metric(
-                    "Retained behavioral (PSF)",
-                    f"{psf_retention['pct']:.0f}%",
-                    f"{psf_retention['retained']} of {psf_retention['randomised']} randomised in PSF",
-                    delta_color="off",
-                )
-
-            overall_rows = []
-            if not med_retention_warning and med_retention["initiated"] > 0:
-                overall_rows.append(("Medication visit", med_retention["initiated"], med_retention["retained"]))
-            if not psf_retention_warning and psf_retention["randomised"] > 0:
-                overall_rows.append(("Behavioral (PSF)", psf_retention["randomised"], psf_retention["retained"]))
-            if overall_rows:
-                fig_overall = go.Figure()
-                fig_overall.add_trace(go.Bar(
-                    y=[r[0] for r in overall_rows],
-                    x=[r[1] for r in overall_rows],
-                    name="Denominator",
-                    orientation="h",
-                    marker_color="#2980b9",
-                    text=[r[1] for r in overall_rows],
-                    textposition="outside",
-                ))
-                fig_overall.add_trace(go.Bar(
-                    y=[r[0] for r in overall_rows],
-                    x=[r[2] for r in overall_rows],
-                    name="Retained",
-                    orientation="h",
-                    marker_color="#2e7d32",
-                    text=[f"{r[2]} ({r[2] / r[1] * 100:.0f}%)" for r in overall_rows],
-                    textposition="outside",
-                ))
-                fig_overall.update_layout(
-                    barmode="group",
-                    height=240,
-                    margin=dict(l=20, r=40, t=30, b=20),
-                    xaxis=dict(title="Participants", range=[0, max(r[1] for r in overall_rows) * 1.35]),
-                    yaxis=dict(title="", autorange="reversed"),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                )
-                show_plot(fig_overall, use_container_width=True)
-
-        with ret_right:
-            st.markdown("**Weekly Retention (Medication visits)**")
-            if med_retention_warning:
-                st.info("Weekly retention needs the visit log date field (see warning on the left).")
-            elif not med_weekly_retention.empty and med_weekly_retention["Due"].sum() > 0:
-                wk = med_weekly_retention
-                pct_labels = [
-                    f"{int(a)} ({p:.0f}%)" if pd.notna(p) else "-"
-                    for a, p in zip(wk["Attended"], wk["Retention %"])
-                ]
-                fig_weekly_ret = go.Figure()
-                fig_weekly_ret.add_trace(go.Bar(
-                    x=wk["Week"],
-                    y=wk["Due"],
-                    name="Due for week",
-                    marker_color="#2980b9",
-                    text=wk["Due"],
-                    textposition="outside",
-                ))
-                fig_weekly_ret.add_trace(go.Bar(
-                    x=wk["Week"],
-                    y=wk["Attended"],
-                    name="Attended visit (%)",
-                    marker_color="#2e7d32",
-                    text=pct_labels,
-                    textposition="outside",
-                ))
-                fig_weekly_ret.update_layout(
-                    barmode="group",
-                    height=420,
-                    margin=dict(l=20, r=20, t=30, b=20),
-                    xaxis=dict(title="Visit window", type="category"),
-                    yaxis=dict(title="Participants", range=[0, max(int(wk["Due"].max()), 1) * 1.2]),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                )
-                show_plot(fig_weekly_ret, use_container_width=True)
-            else:
-                st.info("No medication follow-up visits are due yet.")
-
-        st.caption(
-            "Retained (Medication visit) = participants who honored their latest due "
-            "medication visit (Week 1, 2, 3, 12 or 36; late, on time or early) ÷ all who "
-            "started medication (Day 0 visit date recorded). Weekly: Due = started "
-            "medication and the week's due date has passed; Attended = honored that visit. "
-            "Retained behavioral (PSF) = participants who completed their latest due PSF "
-            "session ÷ all randomised to PSF."
-        )
-        if not med_retention_warning and not med_retention["due_fields_found"]:
-            st.caption(
-                "No week_#_due dates were found, so due dates are Day 0 + 7/14/21/84/252 days."
-            )
-        if not psf_retention_warning and psf_retention.get("n_no_day0"):
-            st.caption(
-                f"{psf_retention['n_no_day0']} PSF participant(s) have no Day 0 date and no "
-                "completed session, so they are counted as not retained."
-            )
 
         st.markdown("---")
 
@@ -2330,6 +2231,143 @@ def main():
             show_plot(fig_weekly, use_container_width=True)
         else:
             st.info("No enrollment date data available yet.")
+
+        st.markdown("---")
+
+        st.subheader("Retention")
+        ret_left, ret_right = st.columns([1, 2])
+
+        with ret_left:
+            st.markdown("**Overall Retention**")
+            if med_retention_warning:
+                st.warning(med_retention_warning)
+            elif med_retention["initiated"] > 0:
+                st.metric(
+                    "Retained (Medication visit)",
+                    f"{med_retention['pct']:.0f}%",
+                    f"{med_retention['retained']} of {med_retention['initiated']} initiated",
+                    delta_color="off",
+                )
+            else:
+                st.info("No participants have started medication yet.")
+
+            if psf_retention_warning:
+                st.warning(psf_retention_warning)
+            elif psf_retention["randomised"] > 0:
+                st.metric(
+                    "Retained behavioral (PSF)",
+                    f"{psf_retention['pct']:.0f}%",
+                    f"{psf_retention['retained']} of {psf_retention['randomised']} randomised in PSF",
+                    delta_color="off",
+                )
+
+            overall_rows = []
+            if not med_retention_warning and med_retention["initiated"] > 0:
+                overall_rows.append(("Medication visit", med_retention["initiated"], med_retention["retained"]))
+            if not psf_retention_warning and psf_retention["randomised"] > 0:
+                overall_rows.append(("Behavioral (PSF)", psf_retention["randomised"], psf_retention["retained"]))
+            if overall_rows:
+                fig_overall = go.Figure()
+                fig_overall.add_trace(go.Bar(
+                    y=[r[0] for r in overall_rows],
+                    x=[r[1] for r in overall_rows],
+                    name="Denominator",
+                    orientation="h",
+                    marker_color="#2980b9",
+                    text=[r[1] for r in overall_rows],
+                    textposition="outside",
+                ))
+                fig_overall.add_trace(go.Bar(
+                    y=[r[0] for r in overall_rows],
+                    x=[r[2] for r in overall_rows],
+                    name="Retained",
+                    orientation="h",
+                    marker_color="#2e7d32",
+                    text=[f"{r[2]} ({r[2] / r[1] * 100:.0f}%)" for r in overall_rows],
+                    textposition="outside",
+                ))
+                fig_overall.update_layout(
+                    barmode="group",
+                    height=240,
+                    margin=dict(l=20, r=40, t=30, b=20),
+                    xaxis=dict(title="Participants", range=[0, max(r[1] for r in overall_rows) * 1.35]),
+                    yaxis=dict(title="", autorange="reversed"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+                show_plot(fig_overall, use_container_width=True)
+
+        with ret_right:
+            st.markdown("**Weekly Retention (Medication visits)**")
+            if med_retention_warning:
+                st.info("Weekly retention needs the visit log date field (see warning on the left).")
+            elif not med_weekly_retention.empty and med_weekly_retention["Due"].sum() > 0:
+                wk = med_weekly_retention
+                pct_labels = [
+                    f"{int(a)} ({p:.0f}%)" if pd.notna(p) else "-"
+                    for a, p in zip(wk["Attended"], wk["Retention %"])
+                ]
+                fig_weekly_ret = go.Figure()
+                fig_weekly_ret.add_trace(go.Bar(
+                    x=wk["Week"],
+                    y=wk["Due"],
+                    name="Due for week",
+                    marker_color="#2980b9",
+                    text=wk["Due"],
+                    textposition="outside",
+                ))
+                fig_weekly_ret.add_trace(go.Bar(
+                    x=wk["Week"],
+                    y=wk["Attended"],
+                    name="Attended visit (%)",
+                    marker_color="#2e7d32",
+                    text=pct_labels,
+                    textposition="outside",
+                ))
+                fig_weekly_ret.update_layout(
+                    barmode="group",
+                    height=420,
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    xaxis=dict(title="Visit window", type="category"),
+                    yaxis=dict(title="Participants", range=[0, max(int(wk["Due"].max()), 1) * 1.2]),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+                show_plot(fig_weekly_ret, use_container_width=True)
+            else:
+                st.info("No medication follow-up visits are due yet.")
+
+        st.caption(
+            "Retained (Medication visit) = participants who honored their latest due "
+            "medication visit (Week 1, 2, 3, 12 or 36; late, on time or early) ÷ all who "
+            "started medication (Day 0 visit date recorded). Weekly: Due = started "
+            "medication and the week's due date has passed; Attended = honored that visit. "
+            "Retained behavioral (PSF) = participants who completed their latest due PSF "
+            "session ÷ all randomised to PSF."
+        )
+        if not med_retention_warning and not med_retention["due_fields_found"]:
+            st.caption(
+                "No week_#_due dates were found, so due dates are Day 0 + 7/14/21/84/252 days."
+            )
+        if not psf_retention_warning and psf_retention.get("n_no_day0"):
+            st.caption(
+                f"{psf_retention['n_no_day0']} PSF participant(s) have no Day 0 date and no "
+                "completed session, so they are counted as not retained."
+            )
+
+        st.markdown("**Not Retained by Week (Medication visits)**")
+        if med_retention_warning:
+            pass
+        elif med_not_retained.empty:
+            st.success("Every participant who was due for a medication visit attended it.")
+        else:
+            week_filter = st.multiselect(
+                "Visit type",
+                MED_FOLLOWUP_WINDOWS,
+                default=[w for w in MED_FOLLOWUP_WINDOWS if w in set(med_not_retained["Visit type"])],
+                key="not_retained_visit_filter",
+            )
+            shown = med_not_retained[med_not_retained["Visit type"].isin(week_filter)]
+            st.caption(f"{len(shown)} missed visit(s) shown. Due for the week but no honored visit recorded.")
+            st.dataframe(shown, use_container_width=True, hide_index=True)
 
         st.markdown("---")
 
