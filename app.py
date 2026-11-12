@@ -2,7 +2,7 @@
 SOAR Study Enrollment & Follow-up Tracker
 =========================================
 A Streamlit dashboard for the SOAR Study REDCap project.
-Displays enrollment funnel, visit adherence, safety screening
+Displays enrollment funnel, retention, safety screening
 (MINI-S / HHDS / AUDIT), upcoming appointments, and generates
 shareable summary reports.
 
@@ -19,6 +19,7 @@ import os
 import re
 from datetime import datetime, timedelta
 
+import numpy as np
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -40,6 +41,21 @@ st.set_page_config(
 # ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
+    /* Garamond everywhere. EB Garamond is loaded as a web-font fallback for
+       machines that do not have Garamond installed. Streamlit's icon font is
+       excluded so icons (expander arrows, metric deltas) keep rendering. */
+    @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;500;600;700;800&display=swap');
+    .stApp, .stApp div, .stApp p, .stApp label, .stApp li, .stApp a, .stApp small,
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+    .stApp button, .stApp input, .stApp textarea, .stApp select,
+    .stApp table, .stApp th, .stApp td,
+    .stApp span:not([data-testid="stIconMaterial"]) {
+        font-family: 'EB Garamond', Garamond, 'Cormorant Garamond', 'Times New Roman', serif !important;
+    }
+    [data-testid="stIconMaterial"] {
+        font-family: "Material Symbols Rounded", "Material Icons" !important;
+    }
+
     /* Theme-adaptive headers: var(--text-color) tracks Streamlit's active
        light/dark theme, and the accent blue + shadow keep contrast strong
        against both a near-white and a near-black page background. */
@@ -84,6 +100,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+PLOT_FONT_FAMILY = "EB Garamond, Garamond, Cormorant Garamond, Times New Roman, serif"
+
+
+def show_plot(fig, **kwargs):
+    """st.plotly_chart with Garamond applied. Streamlit's chart theme would
+    otherwise override the font, so it is set explicitly on every figure."""
+    fig.update_layout(font=dict(family=PLOT_FONT_FAMILY, size=14))
+    return st.plotly_chart(fig, **kwargs)
+
+
 # ───────────────────────────────────────────────────────────────
 # SHARED CONSTANTS
 # ───────────────────────────────────────────────────────────────
@@ -118,6 +144,19 @@ VISIT_WINDOW_CODE_MAP = {
     "4": "Week 12",
     "5": "Week 36",
     **{w: w for w in VISIT_WINDOW_ORDER},
+}
+
+# Medication visits used for retention (Day 0 = medication start, so it forms
+# the denominator rather than a follow-up). Due dates come from the
+# week_#_due fields; if one is missing for a participant it falls back to
+# Day 0 visit date + the nominal offset below.
+MED_FOLLOWUP_WINDOWS = ["Week 1", "Week 2", "Week 3", "Week 12", "Week 36"]
+MED_DUE_FIELDS = {
+    "Week 1": "week_1_due", "Week 2": "week_2_due", "Week 3": "week_3_due",
+    "Week 12": "week_12_due", "Week 36": "week_36_due",
+}
+MED_DUE_FALLBACK_DAYS = {
+    "Week 1": 7, "Week 2": 14, "Week 3": 21, "Week 12": 84, "Week 36": 252,
 }
 
 # Date field on the visit_log form, tried in order. A Day 0 visit-log row with
@@ -1328,6 +1367,193 @@ def build_weekly_retention(visit_matrix):
     return pd.DataFrame(rows)
 
 
+def _last_true_index(mask_2d):
+    """Column index of the last True in each row of a boolean array (-1 if none)."""
+    arr = np.asarray(mask_2d, dtype=bool)
+    if arr.size == 0:
+        return np.full(arr.shape[0], -1)
+    last = arr.shape[1] - 1 - np.argmax(arr[:, ::-1], axis=1)
+    return np.where(arr.any(axis=1), last, -1)
+
+
+def build_medication_retention(df_all, df_visits):
+    """Overall + per-week retention among participants who started medication.
+
+    Initiated  = participants with a dated Day 0 (week 0) visit.
+    Latest due = the latest of Week 1/2/3/12/36 whose due date is on or
+                 before today (none yet due -> only Day 0 is required).
+    Retained   = honored their latest due visit (late, on time or early), or
+                 honored any later visit. Otherwise not active.
+    Honored    = visit status Completed, or a visit date recorded on a visit
+                 that is not Missed / Rescheduled / Withdrawn.
+
+    Weekly rows: Due = initiated and due date <= today; Attended = of those,
+    honored that week's visit.
+
+    Returns (summary_dict, weekly_df, warning).
+    """
+    weekly_cols = ["Week", "Due", "Attended", "Retention %"]
+    empty_weekly = pd.DataFrame(columns=weekly_cols)
+    empty = {"initiated": 0, "retained": 0, "pct": None, "due_fields_found": False}
+
+    dated, id_col, field, warning = _started_medication_rows(df_visits)
+    if warning:
+        return empty, empty_weekly, warning
+
+    d0 = dated[[id_col, field]].copy()
+    d0[id_col] = d0[id_col].astype(str).str.strip()
+    d0["_d"] = pd.to_datetime(d0[field], errors="coerce")
+    day0 = d0.groupby(id_col)["_d"].min()
+    started_ids = day0.index
+    if len(started_ids) == 0:
+        return empty, empty_weekly, "No participants have started medication yet."
+
+    # Honored matrix (participant x week)
+    v = df_visits.copy()
+    v[id_col] = v[id_col].astype(str).str.strip()
+    v["_label"] = v["visit_window"].astype(str).str.strip().map(VISIT_WINDOW_CODE_MAP)
+    v = v[v["_label"].isin(MED_FOLLOWUP_WINDOWS)]
+    if "visit_status" in v.columns:
+        status = v["visit_status"].astype(str).str.strip()
+    else:
+        status = pd.Series("", index=v.index)
+    has_date = pd.to_datetime(v[field], errors="coerce").notna()
+    v["_honored"] = (status == "1") | (has_date & ~status.isin(["2", "3", "4"]))
+    if v.empty:
+        honored = pd.DataFrame(False, index=started_ids, columns=MED_FOLLOWUP_WINDOWS)
+    else:
+        honored = (
+            v.groupby([id_col, "_label"])["_honored"].any().unstack()
+            .reindex(index=started_ids, columns=MED_FOLLOWUP_WINDOWS)
+            .fillna(False).astype(bool)
+        )
+
+    # Due dates (participant x week)
+    all_id = "record_id" if "record_id" in df_all.columns else df_all.columns[0]
+    today = pd.Timestamp.now().normalize()
+    due = pd.DataFrame(index=started_ids, columns=MED_FOLLOWUP_WINDOWS, dtype="datetime64[ns]")
+    due_fields_found = False
+    for w in MED_FOLLOWUP_WINDOWS:
+        col = MED_DUE_FIELDS[w]
+        s = pd.Series(pd.NaT, index=started_ids, dtype="datetime64[ns]")
+        if col in df_all.columns:
+            t = df_all[[all_id, col]].copy()
+            t[all_id] = t[all_id].astype(str).str.strip()
+            t[col] = pd.to_datetime(t[col], errors="coerce")
+            t = t.dropna(subset=[col])
+            if not t.empty:
+                due_fields_found = True
+                s = t.groupby(all_id)[col].min().reindex(started_ids)
+        due[w] = s.fillna(day0 + pd.Timedelta(days=MED_DUE_FALLBACK_DAYS[w]))
+
+    is_due = due.le(today)
+
+    latest_due_idx = _last_true_index(is_due.values)
+    last_honored_idx = _last_true_index(honored.values)
+    retained = last_honored_idx >= latest_due_idx  # none due -> Day 0 is enough
+
+    rows = []
+    for w in MED_FOLLOWUP_WINDOWS:
+        n_due = int(is_due[w].sum())
+        n_att = int((is_due[w] & honored[w]).sum())
+        rows.append({
+            "Week": w,
+            "Due": n_due,
+            "Attended": n_att,
+            "Retention %": round(n_att / n_due * 100, 1) if n_due else None,
+        })
+
+    initiated = int(len(started_ids))
+    n_ret = int(retained.sum())
+    summary = {
+        "initiated": initiated,
+        "retained": n_ret,
+        "pct": n_ret / initiated * 100 if initiated else None,
+        "due_fields_found": due_fields_found,
+    }
+    return summary, pd.DataFrame(rows, columns=weekly_cols), None
+
+
+def build_psf_retention(df_behavioral, day0_dates=None):
+    """Behavioral (PSF) retention = done latest due PSF session / all randomised to PSF.
+
+    Latest due = latest session whose due date (Day 0 + PSF_SESSION_DAY_OFFSETS)
+    is on or before today. Retained = that session is Done, or any later one is.
+    A PSF participant with no Day 0 date and no session done has nothing due
+    and nothing done, so counts as not retained (reported in the caption).
+
+    Returns (summary_dict, warning).
+    """
+    empty = {"randomised": 0, "retained": 0, "pct": None, "n_no_day0": 0}
+    if df_behavioral.empty:
+        return empty, "No Behavioral Tracking records were returned."
+    field = BEHAVIORAL_INTERVENTION_FIELD
+    if field not in df_behavioral.columns:
+        return empty, f"Field '{field}' was not returned by the Behavioral Tracking export."
+
+    id_col = "record_id" if "record_id" in df_behavioral.columns else df_behavioral.columns[0]
+    raw = df_behavioral.copy()
+    raw[id_col] = raw[id_col].astype(str)
+
+    df = raw.copy()
+    df["Label"] = df[field].astype(str).str.strip().str.upper().map(BEHAVIORAL_INTERVENTION_MAP)
+    df = df.dropna(subset=["Label"]).drop_duplicates(subset=[id_col], keep="first")
+    psf_ids = pd.Index(df.loc[df["Label"] == "PSF", id_col].unique())
+    if len(psf_ids) == 0:
+        return empty, "No participants have been assigned to PSF yet."
+
+    present = [f for f in PSF_SESSION_STATUS_FIELDS if f in raw.columns]
+    if not present:
+        return {**empty, "randomised": int(len(psf_ids))}, (
+            "None of the PSF session status fields (bt_psf_s1_status ... "
+            "bt_psf_s8_status) were returned by the export."
+        )
+
+    def _combine(series):
+        v = series.astype(str).str.strip()
+        if (v == "1").any():
+            return "1"
+        if (v == "0").any():
+            return "0"
+        return ""
+
+    sub = raw[raw[id_col].isin(psf_ids)]
+    status = sub.groupby(id_col)[present].agg(_combine).reindex(psf_ids).fillna("")
+    done = pd.DataFrame(
+        {f: (status[f] == "1") if f in status.columns else pd.Series(False, index=psf_ids)
+         for f in PSF_SESSION_STATUS_FIELDS},
+        index=psf_ids,
+    )
+
+    if day0_dates is not None and len(day0_dates) > 0:
+        day0 = day0_dates.reindex(psf_ids)
+    else:
+        day0 = pd.Series(pd.NaT, index=psf_ids, dtype="datetime64[ns]")
+
+    today = pd.Timestamp.now().normalize()
+    is_due = pd.DataFrame(
+        {f: day0.notna() & (today >= day0 + pd.Timedelta(days=off))
+         for f, off in zip(PSF_SESSION_STATUS_FIELDS, PSF_SESSION_DAY_OFFSETS)},
+        index=psf_ids,
+    )
+
+    latest_due_idx = _last_true_index(is_due.values)
+    last_done_idx = _last_true_index(done.values)
+    retained = (last_done_idx >= latest_due_idx) & (
+        (latest_due_idx >= 0) | (last_done_idx >= 0)
+    )
+
+    total = int(len(psf_ids))
+    n_ret = int(retained.sum())
+    n_no_day0 = int((day0.isna().values & ~retained).sum())
+    return {
+        "randomised": total,
+        "retained": n_ret,
+        "pct": n_ret / total * 100,
+        "n_no_day0": n_no_day0,
+    }, None
+
+
 def get_safety_screening_summary(df_clinical):
     """Summarize safety screening results (MINI-S, HHDS, AUDIT)."""
     if df_clinical.empty:
@@ -1622,6 +1848,12 @@ def main():
             "count of participants with an assigned stratum instead."
         )
 
+    # Retention (medication visits + behavioral PSF)
+    med_retention, med_weekly_retention, med_retention_warning = build_medication_retention(
+        df_all, df_visits
+    )
+    psf_retention, psf_retention_warning = build_psf_retention(df_behavioral, day0_dates)
+
     # Started medication = participants with a date on their Day 0 visit log.
     started_med_n, started_med_field, started_med_warning = count_started_medication(df_visits)
 
@@ -1710,7 +1942,7 @@ def main():
             )
         )
         fig_funnel.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=400)
-        st.plotly_chart(fig_funnel, use_container_width=True)
+        show_plot(fig_funnel, use_container_width=True)
 
         st.markdown("---")
 
@@ -1742,7 +1974,7 @@ def main():
                     margin=dict(l=20, r=20, t=20, b=20),
                     title_font=dict(size=18, color="#4a90d9"),
                 )
-                st.plotly_chart(fig_psf_ba, use_container_width=True)
+                show_plot(fig_psf_ba, use_container_width=True)
             with sched_col2:
                 st.dataframe(
                     psf_ba_distribution, use_container_width=True, hide_index=True
@@ -1782,40 +2014,130 @@ def main():
                     margin=dict(l=20, r=20, t=10, b=20),
                     yaxis=dict(categoryorder="total ascending"),
                 )
-                st.plotly_chart(fig_strata, use_container_width=True)
+                show_plot(fig_strata, use_container_width=True)
         else:
             st.info("No stratification data available yet.")
 
         st.markdown("---")
 
-        st.subheader("Visit Adherence Overview")
-        if not visit_matrix.empty:
-            status_counts = (
-                visit_matrix.apply(pd.Series.value_counts).fillna(0).astype(int)
-            )
-            for status in ["Completed", "Pending", "Missed", "Rescheduled", "Withdrawn/Discontinued"]:
-                if status not in status_counts.index:
-                    status_counts.loc[status] = 0
+        st.subheader("Retention")
+        ret_left, ret_right = st.columns([1, 2])
 
-            fig_adherence = px.bar(
-                status_counts.T,
-                barmode="stack",
-                color_discrete_map={
-                    "Completed": "#2e7d32",
-                    "Pending": "#ffc107",
-                    "Missed": "#dc3545",
-                    "Rescheduled": "#17a2b8",
-                    "Withdrawn/Discontinued": "#6c757d",
-                },
-                labels={"value": "Participants", "index": "Visit Window"},
-                height=400,
+        with ret_left:
+            st.markdown("**Overall Retention**")
+            if med_retention_warning:
+                st.warning(med_retention_warning)
+            elif med_retention["initiated"] > 0:
+                st.metric(
+                    "Retained (Medication visit)",
+                    f"{med_retention['pct']:.0f}%",
+                    f"{med_retention['retained']} of {med_retention['initiated']} initiated",
+                    delta_color="off",
+                )
+            else:
+                st.info("No participants have started medication yet.")
+
+            if psf_retention_warning:
+                st.warning(psf_retention_warning)
+            elif psf_retention["randomised"] > 0:
+                st.metric(
+                    "Retained behavioral (PSF)",
+                    f"{psf_retention['pct']:.0f}%",
+                    f"{psf_retention['retained']} of {psf_retention['randomised']} randomised in PSF",
+                    delta_color="off",
+                )
+
+            overall_rows = []
+            if not med_retention_warning and med_retention["initiated"] > 0:
+                overall_rows.append(("Medication visit", med_retention["initiated"], med_retention["retained"]))
+            if not psf_retention_warning and psf_retention["randomised"] > 0:
+                overall_rows.append(("Behavioral (PSF)", psf_retention["randomised"], psf_retention["retained"]))
+            if overall_rows:
+                fig_overall = go.Figure()
+                fig_overall.add_trace(go.Bar(
+                    y=[r[0] for r in overall_rows],
+                    x=[r[1] for r in overall_rows],
+                    name="Denominator",
+                    orientation="h",
+                    marker_color="#2980b9",
+                    text=[r[1] for r in overall_rows],
+                    textposition="outside",
+                ))
+                fig_overall.add_trace(go.Bar(
+                    y=[r[0] for r in overall_rows],
+                    x=[r[2] for r in overall_rows],
+                    name="Retained",
+                    orientation="h",
+                    marker_color="#2e7d32",
+                    text=[f"{r[2]} ({r[2] / r[1] * 100:.0f}%)" for r in overall_rows],
+                    textposition="outside",
+                ))
+                fig_overall.update_layout(
+                    barmode="group",
+                    height=240,
+                    margin=dict(l=20, r=40, t=30, b=20),
+                    xaxis=dict(title="Participants", range=[0, max(r[1] for r in overall_rows) * 1.35]),
+                    yaxis=dict(title="", autorange="reversed"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+                show_plot(fig_overall, use_container_width=True)
+
+        with ret_right:
+            st.markdown("**Weekly Retention (Medication visits)**")
+            if med_retention_warning:
+                st.info("Weekly retention needs the visit log date field (see warning on the left).")
+            elif not med_weekly_retention.empty and med_weekly_retention["Due"].sum() > 0:
+                wk = med_weekly_retention
+                pct_labels = [
+                    f"{int(a)} ({p:.0f}%)" if pd.notna(p) else "-"
+                    for a, p in zip(wk["Attended"], wk["Retention %"])
+                ]
+                fig_weekly_ret = go.Figure()
+                fig_weekly_ret.add_trace(go.Bar(
+                    x=wk["Week"],
+                    y=wk["Due"],
+                    name="Due for week",
+                    marker_color="#2980b9",
+                    text=wk["Due"],
+                    textposition="outside",
+                ))
+                fig_weekly_ret.add_trace(go.Bar(
+                    x=wk["Week"],
+                    y=wk["Attended"],
+                    name="Attended visit (%)",
+                    marker_color="#2e7d32",
+                    text=pct_labels,
+                    textposition="outside",
+                ))
+                fig_weekly_ret.update_layout(
+                    barmode="group",
+                    height=420,
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    xaxis=dict(title="Visit window", type="category"),
+                    yaxis=dict(title="Participants", range=[0, max(int(wk["Due"].max()), 1) * 1.2]),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+                show_plot(fig_weekly_ret, use_container_width=True)
+            else:
+                st.info("No medication follow-up visits are due yet.")
+
+        st.caption(
+            "Retained (Medication visit) = participants who honored their latest due "
+            "medication visit (Week 1, 2, 3, 12 or 36; late, on time or early) ÷ all who "
+            "started medication (Day 0 visit date recorded). Weekly: Due = started "
+            "medication and the week's due date has passed; Attended = honored that visit. "
+            "Retained behavioral (PSF) = participants who completed their latest due PSF "
+            "session ÷ all randomised to PSF."
+        )
+        if not med_retention_warning and not med_retention["due_fields_found"]:
+            st.caption(
+                "No week_#_due dates were found, so due dates are Day 0 + 7/14/21/84/252 days."
             )
-            fig_adherence.update_layout(
-                margin=dict(l=20, r=20, t=30, b=20)
+        if not psf_retention_warning and psf_retention.get("n_no_day0"):
+            st.caption(
+                f"{psf_retention['n_no_day0']} PSF participant(s) have no Day 0 date and no "
+                "completed session, so they are counted as not retained."
             )
-            st.plotly_chart(fig_adherence, use_container_width=True)
-        else:
-            st.info("No visit data available yet.")
 
         st.markdown("---")
 
@@ -1849,7 +2171,7 @@ def main():
                             margin=dict(l=20, r=20, t=60, b=20),
                             title_font=dict(size=18, color="#4a90d9"),
                         )
-                        st.plotly_chart(fig_age, use_container_width=True)
+                        show_plot(fig_age, use_container_width=True)
                         st.caption(
                             f"Median age: {age_stats['median']} years "
                             f"(IQR: {age_stats['q1']}–{age_stats['q3']})"
@@ -1889,7 +2211,7 @@ def main():
                         legend_title_text="Gender",
                         title_font=dict(size=18, color="#4a90d9"),
                     )
-                    st.plotly_chart(fig_sex, use_container_width=True)
+                    show_plot(fig_sex, use_container_width=True)
                 else:
                     st.info("No sex field found — check SEX_FIELD_CANDIDATES.")
         else:
@@ -1944,7 +2266,7 @@ def main():
                 yaxis_title="Cumulative Enrolled",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             )
-            st.plotly_chart(fig_cum, use_container_width=True)
+            show_plot(fig_cum, use_container_width=True)
 
             latest = cumulative_stratified.iloc[-1]
             gap = int(round(latest["Cumulative Target"] - latest["Cumulative Enrolled"]))
@@ -2005,7 +2327,7 @@ def main():
                 xaxis_title=period_word,
                 xaxis_type=x_axis_type,
             )
-            st.plotly_chart(fig_weekly, use_container_width=True)
+            show_plot(fig_weekly, use_container_width=True)
         else:
             st.info("No enrollment date data available yet.")
 
@@ -2091,7 +2413,7 @@ def main():
                     yaxis=dict(range=[0, 105]),
                     margin=dict(l=20, r=20, t=20, b=20),
                 )
-                st.plotly_chart(fig_retention, use_container_width=True)
+                show_plot(fig_retention, use_container_width=True)
                 st.dataframe(
                     weekly_retention, use_container_width=True, hide_index=True
                 )
@@ -2140,7 +2462,7 @@ def main():
                     yaxis=dict(title="", autorange="reversed"),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
                 )
-                st.plotly_chart(fig_psf_sessions, use_container_width=True)
+                show_plot(fig_psf_sessions, use_container_width=True)
 
                 def _n_pct(n, d):
                     return f"{int(n)} ({(n / d * 100) if d else 0:.0f}%)"
@@ -2257,7 +2579,7 @@ def main():
                 yaxis=dict(title="Participants"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             )
-            st.plotly_chart(fig_enroll, use_container_width=True)
+            show_plot(fig_enroll, use_container_width=True)
 
             total_row = pd.DataFrame([{
                 "Month": "Total",
@@ -2359,7 +2681,7 @@ def main():
                         fig_ae_severity.update_layout(
                             showlegend=False, margin=dict(l=20, r=20, t=20, b=20)
                         )
-                        st.plotly_chart(fig_ae_severity, use_container_width=True)
+                        show_plot(fig_ae_severity, use_container_width=True)
                         st.dataframe(
                             ae_severity_summary, use_container_width=True, hide_index=True
                         )
@@ -2386,7 +2708,7 @@ def main():
                             margin=dict(l=20, r=20, t=20, b=20),
                             yaxis=dict(categoryorder="total ascending"),
                         )
-                        st.plotly_chart(fig_ae_outcome, use_container_width=True)
+                        show_plot(fig_ae_outcome, use_container_width=True)
                         st.dataframe(
                             ae_outcome_summary, use_container_width=True, hide_index=True
                         )
