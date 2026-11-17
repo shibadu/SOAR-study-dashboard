@@ -1380,15 +1380,19 @@ def build_medication_retention(df_all, df_visits):
     """Overall + per-week retention among participants who started medication.
 
     Initiated  = participants with a dated Day 0 (week 0) visit.
-    Latest due = the latest of Week 1/2/3/12/36 whose due date is on or
-                 before today (none yet due -> only Day 0 is required).
+    Latest due = the latest of Week 1/2/3/12/36 whose due date is BEFORE
+                 today (none yet due -> only Day 0 is required). A visit due
+                 today is not counted as missed until the day has ended, so
+                 the participant stays active until tomorrow if they do not
+                 come. A visit due today that was already honored still
+                 counts as due + attended.
     Retained   = honored their latest due visit (late, on time or early), or
                  honored any later visit. Otherwise not active.
     Honored    = visit status Completed, or a visit date recorded on a visit
                  that is not Missed / Rescheduled / Withdrawn.
 
-    Weekly rows: Due = initiated and due date <= today; Attended = of those,
-    honored that week's visit.
+    Weekly rows: Due = initiated and due date < today (or due today and
+    already honored); Attended = of those, honored that week's visit.
 
     Returns (summary_dict, weekly_df, not_retained_df, warning), where
     not_retained_df lists each participant who was due for a week but did not
@@ -1450,7 +1454,9 @@ def build_medication_retention(df_all, df_visits):
                 s = t.groupby(all_id)[col].min().reindex(started_ids)
         due[w] = s.fillna(day0 + pd.Timedelta(days=MED_DUE_FALLBACK_DAYS[w]))
 
-    is_due = due.le(today)
+    # Today's appointments are not "due" (i.e. cannot be missed) until the day
+    # is over; they only count today if the participant has already attended.
+    is_due = due.lt(today) | (due.eq(today) & honored)
 
     latest_due_idx = _last_true_index(is_due.values)
     last_honored_idx = _last_true_index(honored.values)
@@ -1497,16 +1503,18 @@ def build_medication_retention(df_all, df_visits):
 
 
 def build_psf_retention(df_behavioral, day0_dates=None):
-    """Behavioral (PSF) retention = done latest due PSF session / all randomised to PSF.
+    """Behavioral (PSF) retention = done latest due PSF session / PSF participants
+    who have completed PSF session 1 (NOT all those randomised to PSF).
 
     Latest due = latest session whose due date (Day 0 + PSF_SESSION_DAY_OFFSETS)
     is on or before today. Retained = that session is Done, or any later one is.
-    A PSF participant with no Day 0 date and no session done has nothing due
-    and nothing done, so counts as not retained (reported in the caption).
+    PSF participants who have not done session 1 are excluded from the
+    denominator (reported as "not_started").
 
     Returns (summary_dict, warning).
     """
-    empty = {"randomised": 0, "retained": 0, "pct": None, "n_no_day0": 0}
+    empty = {"randomised": 0, "started": 0, "not_started": 0, "retained": 0,
+             "pct": None, "n_no_day0": 0}
     if df_behavioral.empty:
         return empty, "No Behavioral Tracking records were returned."
     field = BEHAVIORAL_INTERVENTION_FIELD
@@ -1541,37 +1549,51 @@ def build_psf_retention(df_behavioral, day0_dates=None):
 
     sub = raw[raw[id_col].isin(psf_ids)]
     status = sub.groupby(id_col)[present].agg(_combine).reindex(psf_ids).fillna("")
+    total_randomised = int(len(psf_ids))
+    s1_field = PSF_SESSION_STATUS_FIELDS[0]
+    started_mask = (
+        (status[s1_field] == "1") if s1_field in status.columns
+        else pd.Series(False, index=psf_ids)
+    )
+    # Denominator: only PSF participants who have done PSF session 1.
+    started_ids = psf_ids[started_mask.values]
+    base = {**empty, "randomised": total_randomised,
+            "started": int(len(started_ids)),
+            "not_started": total_randomised - int(len(started_ids))}
+    if len(started_ids) == 0:
+        return base, "No PSF-assigned participants have completed PSF session 1 yet."
+
+    status = status.loc[started_ids]
     done = pd.DataFrame(
-        {f: (status[f] == "1") if f in status.columns else pd.Series(False, index=psf_ids)
+        {f: (status[f] == "1") if f in status.columns else pd.Series(False, index=started_ids)
          for f in PSF_SESSION_STATUS_FIELDS},
-        index=psf_ids,
+        index=started_ids,
     )
 
     if day0_dates is not None and len(day0_dates) > 0:
-        day0 = day0_dates.reindex(psf_ids)
+        day0 = day0_dates.reindex(started_ids)
     else:
-        day0 = pd.Series(pd.NaT, index=psf_ids, dtype="datetime64[ns]")
+        day0 = pd.Series(pd.NaT, index=started_ids, dtype="datetime64[ns]")
 
     today = pd.Timestamp.now().normalize()
     is_due = pd.DataFrame(
         {f: day0.notna() & (today >= day0 + pd.Timedelta(days=off))
          for f, off in zip(PSF_SESSION_STATUS_FIELDS, PSF_SESSION_DAY_OFFSETS)},
-        index=psf_ids,
+        index=started_ids,
     )
 
     latest_due_idx = _last_true_index(is_due.values)
     last_done_idx = _last_true_index(done.values)
-    retained = (last_done_idx >= latest_due_idx) & (
-        (latest_due_idx >= 0) | (last_done_idx >= 0)
-    )
+    # Session 1 is done for everyone here, so last_done_idx >= 0 always.
+    retained = last_done_idx >= latest_due_idx
 
-    total = int(len(psf_ids))
+    n_started = int(len(started_ids))
     n_ret = int(retained.sum())
     n_no_day0 = int((day0.isna().values & ~retained).sum())
     return {
-        "randomised": total,
+        **base,
         "retained": n_ret,
-        "pct": n_ret / total * 100,
+        "pct": n_ret / n_started * 100,
         "n_no_day0": n_no_day0,
     }, None
 
@@ -2253,19 +2275,19 @@ def main():
 
             if psf_retention_warning:
                 st.warning(psf_retention_warning)
-            elif psf_retention["randomised"] > 0:
+            elif psf_retention["started"] > 0:
                 st.metric(
                     "Retained behavioral (PSF)",
                     f"{psf_retention['pct']:.0f}%",
-                    f"{psf_retention['retained']} of {psf_retention['randomised']} randomised in PSF",
+                    f"{psf_retention['retained']} of {psf_retention['started']} who did PSF session 1",
                     delta_color="off",
                 )
 
             overall_rows = []
             if not med_retention_warning and med_retention["initiated"] > 0:
                 overall_rows.append(("Medication visit", med_retention["initiated"], med_retention["retained"]))
-            if not psf_retention_warning and psf_retention["randomised"] > 0:
-                overall_rows.append(("Behavioral (PSF)", psf_retention["randomised"], psf_retention["retained"]))
+            if not psf_retention_warning and psf_retention["started"] > 0:
+                overall_rows.append(("Behavioral (PSF)", psf_retention["started"], psf_retention["retained"]))
             if overall_rows:
                 fig_overall = go.Figure()
                 fig_overall.add_trace(go.Bar(
@@ -2338,19 +2360,23 @@ def main():
         st.caption(
             "Retained (Medication visit) = participants who honored their latest due "
             "medication visit (Week 1, 2, 3, 12 or 36; late, on time or early) ÷ all who "
-            "started medication (Day 0 visit date recorded). Weekly: Due = started "
-            "medication and the week's due date has passed; Attended = honored that visit. "
-            "Retained behavioral (PSF) = participants who completed their latest due PSF "
-            "session ÷ all randomised to PSF."
+            "started medication (Day 0 visit date recorded). A visit due today is not "
+            "counted as missed until the day has ended (participants stay active until "
+            "tomorrow). Weekly: Due = started medication and the week's due date is "
+            "before today (or due today and already attended); Attended = honored that "
+            "visit. Retained behavioral (PSF) = participants who completed their latest "
+            "due PSF session ÷ PSF participants who have done PSF session 1 (not all "
+            "randomised to PSF)."
         )
         if not med_retention_warning and not med_retention["due_fields_found"]:
             st.caption(
                 "No week_#_due dates were found, so due dates are Day 0 + 7/14/21/84/252 days."
             )
-        if not psf_retention_warning and psf_retention.get("n_no_day0"):
+        if psf_retention.get("not_started"):
             st.caption(
-                f"{psf_retention['n_no_day0']} PSF participant(s) have no Day 0 date and no "
-                "completed session, so they are counted as not retained."
+                f"{psf_retention['not_started']} of {psf_retention['randomised']} participants "
+                "randomised to PSF have not done PSF session 1 yet and are excluded from the "
+                "PSF retention denominator."
             )
 
         st.markdown("**Not Retained by Week (Medication visits)**")
