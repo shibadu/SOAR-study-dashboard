@@ -176,10 +176,13 @@ SCREENING_DATE_FIELD_CANDIDATES = [
     "ps_date",
 ]
 
-# Target rate of stratified (randomized) enrollment, used both for the
-# "Enrollments by Week" reference line and the "Cumulative Enrollments"
-# target line.
+# Enrollment targets. Weekly/monthly are flat reference lines on the
+# "Enrollments by Week/Month" chart (the monthly target is a standard 16,
+# regardless of how many days the month has). TOTAL is the overall
+# randomisation goal shown in the progress donut.
 WEEKLY_ENROLLMENT_TARGET = 4
+MONTHLY_ENROLLMENT_TARGET = 16
+TOTAL_ENROLLMENT_TARGET = 300
 
 AGE_GROUP_LABELS = ["18-30", "31-40", "41-50", "51-60", "60+"]
 AGE_GROUP_BINS = [17, 30, 40, 50, 60, float("inf")]
@@ -880,12 +883,19 @@ def build_visit_matrix(df_visits):
 
     return matrix
 
-def get_upcoming_visits(df_clinical, days_ahead=7):
-    """List participants with visits due in the next N days."""
+def get_upcoming_visits(df_clinical, days_ahead=7, df_all=None):
+    """List participants with visits due today (Days Left = 0) through the next N days.
+
+    Day 0 is included alongside Weeks 1/2/3/12/36. Due dates are read from
+    every row of the export (earliest value per participant) rather than only
+    the clinical-evaluation row, because a due-date field can sit on a
+    different row from ce_date. Only participants with a clinical evaluation
+    are listed.
+    """
     today = pd.Timestamp.now().normalize()
     end_window = today + timedelta(days=days_ahead)
+    out_cols = ["Record ID", "Participant ID", "Visit", "Due Date", "Days Left"]
 
-    upcoming = []
     due_cols = {
         "Day 0": "day_0_due",
         "Week 1": "week_1_due",
@@ -896,33 +906,50 @@ def get_upcoming_visits(df_clinical, days_ahead=7):
     }
 
     if df_clinical.empty:
-        return pd.DataFrame(upcoming)
+        return pd.DataFrame(columns=out_cols)
 
-    id_col = "record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]
-    study_id_col = "study_id" if "study_id" in df_clinical.columns else None
+    clin_id = "record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]
+    clinical_ids = set(df_clinical[clin_id].astype(str).str.strip())
 
-    for _, row in df_clinical.iterrows():
-        for visit_name, col in due_cols.items():
-            if col in row and pd.notna(row.get(col)):
-                try:
-                    due_date = pd.to_datetime(row[col])
-                    if today <= due_date <= end_window:
-                        upcoming.append(
-                            {
-                                "Record ID": row.get(id_col),
-                                "Participant ID": row.get(study_id_col) if study_id_col else "N/A",
-                                "Visit": visit_name,
-                                "Due Date": due_date.strftime("%Y-%m-%d"),
-                                "Days Left": (due_date - today).days,
-                            }
-                        )
-                except Exception:
-                    continue
+    source = df_all if df_all is not None and not df_all.empty else df_clinical
+    src_id = "record_id" if "record_id" in source.columns else source.columns[0]
+    src = source.copy()
+    src["_rid"] = src[src_id].astype(str).str.strip()
+    src = src[src["_rid"].isin(clinical_ids)]
 
+    study_ids = {}
+    if "study_id" in src.columns:
+        sid = src[~_is_blank(src["study_id"])].drop_duplicates("_rid")
+        study_ids = sid.set_index("_rid")["study_id"].to_dict()
+
+    upcoming = []
+    for visit_name, col in due_cols.items():
+        if col not in src.columns:
+            continue
+        d = src[["_rid", col]].copy()
+        d["_d"] = pd.to_datetime(d[col], errors="coerce")
+        d = d.dropna(subset=["_d"])
+        if d.empty:
+            continue
+        first_due = d.groupby("_rid")["_d"].min()
+        for rid, due_date in first_due.items():
+            if today <= due_date <= end_window:
+                upcoming.append(
+                    {
+                        "Record ID": rid,
+                        "Participant ID": study_ids.get(rid, "N/A"),
+                        "Visit": visit_name,
+                        "Due Date": due_date.strftime("%Y-%m-%d"),
+                        "Days Left": (due_date - today).days,
+                    }
+                )
+
+    if not upcoming:
+        return pd.DataFrame(columns=out_cols)
     return (
-        pd.DataFrame(upcoming).sort_values("Days Left")
-        if upcoming
-        else pd.DataFrame(upcoming)
+        pd.DataFrame(upcoming)
+        .sort_values(["Days Left", "Record ID"])
+        .reset_index(drop=True)
     )
 
 def get_overdue_visits(df_clinical, df_visits):
@@ -1258,8 +1285,8 @@ def build_enrollment_trends(df_clinical, view_by="Weekly"):
     - "Stratified" = rows where ce_assigned_strata is populated
 
     view_by: "Weekly" (weeks starting Monday) or "Monthly" (calendar months).
-    Targets scale with the period: WEEKLY_ENROLLMENT_TARGET per week, or
-    WEEKLY_ENROLLMENT_TARGET * (days in month / 7) per month.
+    Targets are flat: WEEKLY_ENROLLMENT_TARGET per week or
+    MONTHLY_ENROLLMENT_TARGET (16) per month, regardless of month length.
 
     Returns (enrollment_df, cumulative_stratified_df), each empty if the
     required fields aren't present. Both carry a "Period" label column.
@@ -1274,9 +1301,7 @@ def build_enrollment_trends(df_clinical, view_by="Weekly"):
 
     def _target_for(period_start):
         """Enrollment target for the single period starting at period_start."""
-        if monthly:
-            return WEEKLY_ENROLLMENT_TARGET * period_start.days_in_month / 7
-        return WEEKLY_ENROLLMENT_TARGET
+        return MONTHLY_ENROLLMENT_TARGET if monthly else WEEKLY_ENROLLMENT_TARGET
 
     df = df_clinical.copy()
     df["ce_date_parsed"] = pd.to_datetime(df["ce_date"], errors="coerce")
@@ -1312,21 +1337,6 @@ def build_enrollment_trends(df_clinical, view_by="Weekly"):
                 .sort_values("period")
             )
             period_counts["Cumulative Enrolled"] = period_counts["Count"].cumsum()
-
-            # Cumulative Target grows for every calendar period elapsed since
-            # the first stratified enrollment, so gaps with zero enrollments
-            # still count against the target.
-            first_period = period_counts["period"].min()
-            if monthly:
-                # Sum the (days-in-month / 7) * weekly target of every month
-                # from the first enrollment month through each row's month.
-                def _cum_target(p):
-                    months = pd.date_range(first_period, p, freq="MS")
-                    return sum(_target_for(m) for m in months)
-                period_counts["Cumulative Target"] = period_counts["period"].apply(_cum_target)
-            else:
-                weeks_elapsed = ((period_counts["period"] - first_period).dt.days // 7) + 1
-                period_counts["Cumulative Target"] = weeks_elapsed * WEEKLY_ENROLLMENT_TARGET
 
             period_counts["Period"] = period_counts["period"].dt.strftime(label_fmt)
             cumulative_stratified = period_counts
@@ -1848,7 +1858,8 @@ def main():
     # ── Compute metrics ──
     enrollment = process_enrollment(df_prescreen, df_clinical)
     visit_matrix = build_visit_matrix(df_visits)
-    upcoming = get_upcoming_visits(df_clinical, days_ahead=7)
+    upcoming = get_upcoming_visits(df_clinical, days_ahead=7, df_all=df_all)
+    day0_due_missing = "day_0_due" not in df_all.columns
     overdue = get_overdue_visits(df_clinical, df_visits)
     safety = get_safety_screening_summary(df_clinical)
     strata_summary = build_stratification_summary(df_clinical)
@@ -2159,52 +2170,74 @@ def main():
         x_axis_type = "category" if enroll_view_by == "Monthly" else None
 
         st.subheader(f"Cumulative Enrollments (by {period_word})")
-        if not cumulative_stratified.empty:
-            achieved_color = rocket_colors(3)[1]
-            target_color = "#e63946"
+        cum_col, donut_col = st.columns([2, 1])
 
-            fig_cum = go.Figure()
-            fig_cum.add_trace(go.Scatter(
-                x=cumulative_stratified["Period"],
-                y=cumulative_stratified["Cumulative Enrolled"],
-                mode="lines+markers+text",
-                name="Cumulative Achieved",
-                text=cumulative_stratified["Cumulative Enrolled"],
-                textposition="top center",
-                line=dict(color=achieved_color, width=3),
-                marker=dict(color=achieved_color, size=8),
-            ))
-            fig_cum.add_trace(go.Scatter(
-                x=cumulative_stratified["Period"],
-                y=cumulative_stratified["Cumulative Target"],
-                mode="lines",
-                name="Cumulative Target",
-                line=dict(color=target_color, width=2, dash="dash"),
-            ))
-            fig_cum.update_layout(
-                height=380,
-                margin=dict(l=20, r=20, t=30, b=20),
-                xaxis_title=period_word,
-                xaxis_type=x_axis_type,
-                yaxis_title="Cumulative Enrolled",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            )
-            show_plot(fig_cum, use_container_width=True)
+        with cum_col:
+            if not cumulative_stratified.empty:
+                achieved_color = rocket_colors(3)[1]
 
-            latest = cumulative_stratified.iloc[-1]
-            gap = int(round(latest["Cumulative Target"] - latest["Cumulative Enrolled"]))
-            if gap > 0:
-                gap_text = f"{gap} behind target"
-            elif gap < 0:
-                gap_text = f"{abs(gap)} ahead of target"
+                fig_cum = go.Figure()
+                fig_cum.add_trace(go.Scatter(
+                    x=cumulative_stratified["Period"],
+                    y=cumulative_stratified["Cumulative Enrolled"],
+                    mode="lines+markers+text",
+                    name="Cumulative Achieved",
+                    text=cumulative_stratified["Cumulative Enrolled"],
+                    textposition="top center",
+                    line=dict(color=achieved_color, width=3),
+                    marker=dict(color=achieved_color, size=8),
+                ))
+                fig_cum.update_layout(
+                    height=380,
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    xaxis_title=period_word,
+                    xaxis_type=x_axis_type,
+                    yaxis_title="Cumulative Enrolled",
+                    showlegend=False,
+                )
+                show_plot(fig_cum, use_container_width=True)
+
+                latest = cumulative_stratified.iloc[-1]
+                st.caption(
+                    f"Latest {period_word.lower()}: {int(latest['Cumulative Enrolled'])} "
+                    "cumulative enrollments."
+                )
             else:
-                gap_text = "on target"
-            st.caption(
-                f"Latest {period_word.lower()}: {int(latest['Cumulative Enrolled'])} achieved vs "
-                f"{int(round(latest['Cumulative Target']))} targeted ({gap_text})."
+                st.info("No stratification date data available yet.")
+
+        with donut_col:
+            progress_pct = randomised_n / TOTAL_ENROLLMENT_TARGET * 100
+            remaining_n = max(TOTAL_ENROLLMENT_TARGET - randomised_n, 0)
+            fig_donut = go.Figure(
+                go.Pie(
+                    labels=["Randomised", "Remaining"],
+                    values=[randomised_n, remaining_n],
+                    hole=0.65,
+                    sort=False,
+                    direction="clockwise",
+                    marker=dict(colors=[rocket_colors(3)[1], "#d9d9d9"]),
+                    textinfo="none",
+                    hovertemplate="%{label}: %{value}<extra></extra>",
+                )
             )
-        else:
-            st.info("No stratification date data available yet.")
+            fig_donut.update_layout(
+                height=380,
+                margin=dict(l=20, r=20, t=50, b=20),
+                title=f"Progress to {TOTAL_ENROLLMENT_TARGET}",
+                title_font=dict(size=18, color="#4a90d9"),
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5),
+                annotations=[
+                    dict(
+                        text=(
+                            f"<b>{progress_pct:.1f}%</b><br>"
+                            f"{randomised_n} of {TOTAL_ENROLLMENT_TARGET}"
+                        ),
+                        x=0.5, y=0.5, showarrow=False, font=dict(size=22),
+                    )
+                ],
+            )
+            show_plot(fig_donut, use_container_width=True)
 
         st.markdown("---")
 
@@ -2221,30 +2254,24 @@ def main():
                 marker_color=rocket_colors(len(weekly_enrollment)),
                 textposition="outside",
             )
+            # Flat target line: 4 per week, or a standard 16 per month.
             if enroll_view_by == "Weekly":
-                fig_weekly.add_hline(
-                    y=WEEKLY_ENROLLMENT_TARGET,
-                    line_dash="dash",
-                    line_width=2,
-                    line_color="#e63946",
-                    annotation_text=f"Target: {WEEKLY_ENROLLMENT_TARGET}/week",
-                    annotation_position="top left",
-                    annotation_font_color="#e63946",
-                )
+                target_val, target_unit = WEEKLY_ENROLLMENT_TARGET, "week"
             else:
-                # Months differ in length, so the target is a per-month line.
-                fig_weekly.add_trace(go.Scatter(
-                    x=weekly_enrollment["Period"],
-                    y=weekly_enrollment["Target"],
-                    mode="lines",
-                    name="Target",
-                    line=dict(color="#e63946", width=2, dash="dash"),
-                    hovertemplate="Target: %{y:.1f}<extra></extra>",
-                ))
-                fig_weekly.update_layout(
-                    showlegend=True,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                )
+                target_val, target_unit = MONTHLY_ENROLLMENT_TARGET, "month"
+            fig_weekly.add_hline(
+                y=target_val,
+                line_dash="dash",
+                line_width=2,
+                line_color="#e63946",
+                annotation_text=f"Target: {target_val}/{target_unit}",
+                annotation_position="top left",
+                annotation_font_color="#e63946",
+            )
+            # Shapes do not drive autorange, so size the axis to keep the line in view.
+            fig_weekly.update_yaxes(
+                range=[0, max(int(weekly_enrollment["Enrollments"].max()), target_val) * 1.25]
+            )
             fig_weekly.update_layout(
                 margin=dict(l=20, r=20, t=30, b=20),
                 xaxis_title=period_word,
@@ -2415,6 +2442,8 @@ def main():
                 st.dataframe(upcoming, use_container_width=True, hide_index=True)
             else:
                 st.info("No visits scheduled in the next 7 days.")
+            if day0_due_missing:
+                st.caption("The 'day_0_due' field was not returned by REDCap, so Day 0 visits cannot be listed.")
 
         st.caption(
             "Terminated and Missed Day 0 participants are excluded from the "
@@ -2704,6 +2733,8 @@ def main():
                 st.dataframe(upcoming, use_container_width=True, hide_index=True)
             else:
                 st.info("No visits due in the next 7 days.")
+            if day0_due_missing:
+                st.caption("The 'day_0_due' field was not returned by REDCap, so Day 0 visits cannot be listed.")
 
         with tab3:
             st.subheader(f"Adverse Events ({total_ae})")
