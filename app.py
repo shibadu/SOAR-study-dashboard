@@ -158,6 +158,13 @@ MED_DUE_FIELDS = {
 MED_DUE_FALLBACK_DAYS = {
     "Week 1": 7, "Week 2": 14, "Week 3": 21, "Week 12": 84, "Week 36": 252,
 }
+# Catch-up (rebasing) rule. When a participant attends a visit LATE, the next
+# visit is expected one nominal gap later (e.g. Week 2 -> Week 3 = 7 days),
+# counted from the actual attendance date, instead of staying fixed to the
+# original Day 0 schedule. Windows listed here are the exception: they stay
+# anchored to Day 0 (assumed because they are protocol-fixed assessment
+# points). Empty this set to rebase every window.
+REBASE_EXEMPT_WINDOWS = {"Week 12", "Week 36"}
 
 # Date field on the visit_log form, tried in order. A Day 0 visit-log row with
 # a date in this field = participant started medication. If none of these
@@ -883,143 +890,10 @@ def build_visit_matrix(df_visits):
 
     return matrix
 
-def get_upcoming_visits(df_clinical, days_ahead=7, df_all=None):
-    """List participants with visits due today (Days Left = 0) through the next N days.
-
-    Day 0 is included alongside Weeks 1/2/3/12/36. Due dates are read from
-    every row of the export (earliest value per participant) rather than only
-    the clinical-evaluation row, because a due-date field can sit on a
-    different row from ce_date. Only participants with a clinical evaluation
-    are listed.
-    """
-    today = pd.Timestamp.now().normalize()
-    end_window = today + timedelta(days=days_ahead)
-    out_cols = ["Record ID", "Participant ID", "Visit", "Due Date", "Days Left"]
-
-    due_cols = {
-        "Day 0": "day_0_due",
-        "Week 1": "week_1_due",
-        "Week 2": "week_2_due",
-        "Week 3": "week_3_due",
-        "Week 12": "week_12_due",
-        "Week 36": "week_36_due",
-    }
-
-    if df_clinical.empty:
-        return pd.DataFrame(columns=out_cols)
-
-    clin_id = "record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]
-    clinical_ids = set(df_clinical[clin_id].astype(str).str.strip())
-
-    source = df_all if df_all is not None and not df_all.empty else df_clinical
-    src_id = "record_id" if "record_id" in source.columns else source.columns[0]
-    src = source.copy()
-    src["_rid"] = src[src_id].astype(str).str.strip()
-    src = src[src["_rid"].isin(clinical_ids)]
-
-    study_ids = {}
-    if "study_id" in src.columns:
-        sid = src[~_is_blank(src["study_id"])].drop_duplicates("_rid")
-        study_ids = sid.set_index("_rid")["study_id"].to_dict()
-
-    upcoming = []
-    for visit_name, col in due_cols.items():
-        if col not in src.columns:
-            continue
-        d = src[["_rid", col]].copy()
-        d["_d"] = pd.to_datetime(d[col], errors="coerce")
-        d = d.dropna(subset=["_d"])
-        if d.empty:
-            continue
-        first_due = d.groupby("_rid")["_d"].min()
-        for rid, due_date in first_due.items():
-            if today <= due_date <= end_window:
-                upcoming.append(
-                    {
-                        "Record ID": rid,
-                        "Participant ID": study_ids.get(rid, "N/A"),
-                        "Visit": visit_name,
-                        "Due Date": due_date.strftime("%Y-%m-%d"),
-                        "Days Left": (due_date - today).days,
-                    }
-                )
-
-    if not upcoming:
-        return pd.DataFrame(columns=out_cols)
-    return (
-        pd.DataFrame(upcoming)
-        .sort_values(["Days Left", "Record ID"])
-        .reset_index(drop=True)
-    )
-
-def get_overdue_visits(df_clinical, df_visits):
-    """Find participants whose due date has passed but no completed visit."""
-    today = pd.Timestamp.now().normalize()
-
-    completed = pd.DataFrame()
-    if not df_visits.empty and "visit_status" in df_visits.columns:
-        completed = df_visits[df_visits["visit_status"] == "1"].copy()
-        if "visit_window" in completed.columns:
-            completed["visit_label"] = completed["visit_window"].astype(str).str.strip().map(
-                VISIT_WINDOW_CODE_MAP
-            )
-
-    overdue = []
-    due_cols = {
-        "Week 1": "week_1_due",
-        "Week 2": "week_2_due",
-        "Week 3": "week_3_due",
-        "Week 12": "week_12_due",
-        "Week 36": "week_36_due",
-    }
-
-    if df_clinical.empty:
-        return pd.DataFrame(overdue)
-
-    id_col = "record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]
-    study_id_col = "study_id" if "study_id" in df_clinical.columns else None
-
-    for _, row in df_clinical.iterrows():
-        pid = row.get(id_col)
-        for visit_name, col in due_cols.items():
-            if col in row and pd.notna(row.get(col)):
-                try:
-                    due_date = pd.to_datetime(row[col])
-                    if due_date < today:
-                        already_done = pd.DataFrame()
-                        if not completed.empty and "visit_label" in completed.columns:
-                            match_id = completed[id_col] == pid if id_col in completed.columns else False
-                            already_done = completed[
-                                match_id & (completed["visit_label"] == visit_name)
-                            ]
-
-                        if already_done.empty:
-                            overdue.append(
-                                {
-                                    "Record ID": pid,
-                                    "Participant ID": row.get(study_id_col) if study_id_col else "N/A",
-                                    "Visit": visit_name,
-                                    "Due Date": due_date.strftime("%Y-%m-%d"),
-                                    "Days Overdue": (today - due_date).days,
-                                }
-                            )
-                except Exception:
-                    continue
-
-    return (
-        pd.DataFrame(overdue).sort_values("Days Overdue", ascending=False)
-        if overdue
-        else pd.DataFrame(overdue)
-    )
-
-def _started_medication_rows(df_visits):
-    """Day 0 visit-log rows that carry a date (= medication started).
-
-    Returns (dated_rows_df, id_col, date_field_used, warning).
-    """
-    if df_visits.empty or "visit_window" not in df_visits.columns:
-        return None, None, None, "No visit log data available to count medication starts."
-
+def _detect_visit_date_field(df_visits):
+    """Name of the visit-log date column (or None)."""
+    if df_visits is None or df_visits.empty:
+        return None
     field = next((c for c in VISIT_DATE_FIELD_CANDIDATES if c in df_visits.columns), None)
     if field is None:
         field = next(
@@ -1030,6 +904,269 @@ def _started_medication_rows(df_visits):
             ),
             None,
         )
+    return field
+
+
+def build_visit_schedule(df_all, df_visits, ids=None, day0=None, fallback_from_day0=False):
+    """Per-participant follow-up schedule that tolerates participants running
+    behind. One row per participant, one column per follow-up window
+    (MED_FOLLOWUP_WINDOWS). Returns a dict of DataFrames:
+
+      orig_due      original due date (earliest week_#_due per participant;
+                    optionally falling back to Day 0 + nominal offset)
+      honored       visit attended (status Completed, or a visit date recorded
+                    on a visit not Missed / Rescheduled / Withdrawn)
+      honored_date  date of the attended visit (earliest, NaT if not dated)
+      eff_due       EFFECTIVE due date. = orig_due, unless the previous
+                    window was attended late, in which case
+                    max(orig_due, previous attendance date + nominal gap).
+                    Windows in REBASE_EXEMPT_WINDOWS stay on orig_due.
+      later_honored a LATER window was attended, so this window (if not
+                    attended) is superseded: the participant is back in care
+                    and the missed visit is no longer an action item.
+      late          attended after the original due date
+
+    plus "study_ids" (record -> study id) and "due_fields_found".
+    """
+    windows = MED_FOLLOWUP_WINDOWS
+    all_id = "record_id" if "record_id" in df_all.columns else df_all.columns[0]
+    base = df_all.copy()
+    base["_rid"] = base[all_id].astype(str).str.strip()
+    if ids is None:
+        ids = pd.Index(base["_rid"].unique())
+    else:
+        ids = pd.Index(sorted({str(i).strip() for i in ids}))
+
+    # Original due dates
+    due_fields_found = False
+    orig = {}
+    for w in windows:
+        s_w = pd.Series(pd.NaT, index=ids, dtype="datetime64[ns]")
+        col = MED_DUE_FIELDS[w]
+        if col in base.columns:
+            t = base[["_rid", col]].copy()
+            t[col] = pd.to_datetime(t[col], errors="coerce")
+            t = t.dropna(subset=[col])
+            if not t.empty:
+                due_fields_found = True
+                s_w = t.groupby("_rid")[col].min().reindex(ids)
+        if fallback_from_day0 and day0 is not None:
+            s_w = s_w.fillna(day0.reindex(ids) + pd.Timedelta(days=MED_DUE_FALLBACK_DAYS[w]))
+        orig[w] = s_w
+    orig = pd.DataFrame(orig, index=ids)
+
+    # Attended visits (and their dates)
+    honored = pd.DataFrame(False, index=ids, columns=windows)
+    hdate = pd.DataFrame(
+        {w: pd.Series(pd.NaT, index=ids, dtype="datetime64[ns]") for w in windows}
+    )
+    if (
+        df_visits is not None and not df_visits.empty
+        and "visit_window" in df_visits.columns
+    ):
+        vid = "record_id" if "record_id" in df_visits.columns else df_visits.columns[0]
+        v = df_visits.copy()
+        v["_rid"] = v[vid].astype(str).str.strip()
+        v["_label"] = v["visit_window"].astype(str).str.strip().map(VISIT_WINDOW_CODE_MAP)
+        v = v[v["_label"].isin(windows) & v["_rid"].isin(ids)]
+        if not v.empty:
+            status = (
+                v["visit_status"].astype(str).str.strip()
+                if "visit_status" in v.columns else pd.Series("", index=v.index)
+            )
+            date_field = _detect_visit_date_field(df_visits)
+            vdate = (
+                pd.to_datetime(v[date_field], errors="coerce")
+                if date_field else pd.Series(pd.NaT, index=v.index)
+            )
+            v["_vdate"] = vdate
+            v["_honored"] = (status == "1") | (vdate.notna() & ~status.isin(["2", "3", "4"]))
+            h = v[v["_honored"]]
+            if not h.empty:
+                flags = h.groupby(["_rid", "_label"]).size().unstack()
+                honored = (
+                    flags.reindex(index=ids, columns=windows).fillna(0) > 0
+                ).astype(bool)
+                dated = h.dropna(subset=["_vdate"])
+                if not dated.empty:
+                    hdate = (
+                        dated.groupby(["_rid", "_label"])["_vdate"].min().unstack()
+                        .reindex(index=ids, columns=windows)
+                    )
+                    hdate = hdate.apply(pd.to_datetime)
+
+    # A later window attended => earlier unattended windows are superseded
+    hv = honored.values
+    later = np.zeros_like(hv, dtype=bool)
+    for j in range(len(windows)):
+        later[:, j] = hv[:, j + 1:].any(axis=1) if j + 1 < len(windows) else False
+    later_honored = pd.DataFrame(later, index=ids, columns=windows)
+
+    # Effective due dates (rebased after a late visit)
+    eff = orig.copy()
+    for j, w in enumerate(windows):
+        if j == 0 or w in REBASE_EXEMPT_WINDOWS:
+            continue
+        prev = windows[j - 1]
+        gap = MED_DUE_FALLBACK_DAYS[w] - MED_DUE_FALLBACK_DAYS[prev]
+        rebased = hdate[prev] + pd.Timedelta(days=gap)
+        eff[w] = (
+            pd.concat([orig[w], rebased], axis=1).max(axis=1).where(orig[w].notna())
+        )
+
+    late = honored & hdate.notna() & (hdate > orig)
+
+    study_ids = {}
+    if "study_id" in base.columns:
+        sid = base[~_is_blank(base["study_id"])].drop_duplicates("_rid")
+        study_ids = sid.set_index("_rid")["study_id"].to_dict()
+
+    return {
+        "orig_due": orig, "eff_due": eff, "honored": honored,
+        "honored_date": hdate, "later_honored": later_honored, "late": late,
+        "study_ids": study_ids, "due_fields_found": due_fields_found,
+    }
+
+
+def get_upcoming_visits(df_clinical, df_all, schedule, days_ahead=7):
+    """Visits due today (Days Left = 0) through the next N days.
+
+    - Day 0 comes from day_0_due (read from every row of the export, earliest
+      per participant, because the field can sit on a different row from ce_date).
+    - Follow-up visits use the EFFECTIVE due date (rebased after a late visit)
+      and exclude visits already attended.
+    """
+    today = pd.Timestamp.now().normalize()
+    end_window = today + timedelta(days=days_ahead)
+    out_cols = ["Record ID", "Participant ID", "Visit", "Due Date",
+                "Original Due Date", "Days Left"]
+    if df_clinical.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    study_ids = schedule["study_ids"]
+    rows = []
+
+    def _add(rid, visit, due, orig_due):
+        rows.append({
+            "Record ID": rid,
+            "Participant ID": study_ids.get(rid, "N/A"),
+            "Visit": visit,
+            "Due Date": due.strftime("%Y-%m-%d"),
+            "Original Due Date": (orig_due if pd.notna(orig_due) else due).strftime("%Y-%m-%d"),
+            "Days Left": (due - today).days,
+        })
+
+    # Day 0
+    clin_id = "record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]
+    clinical_ids = {str(i).strip() for i in df_clinical[clin_id]}
+    source = df_all if df_all is not None and not df_all.empty else df_clinical
+    src_id = "record_id" if "record_id" in source.columns else source.columns[0]
+    if "day_0_due" in source.columns:
+        d = source[[src_id, "day_0_due"]].copy()
+        d["_rid"] = d[src_id].astype(str).str.strip()
+        d = d[d["_rid"].isin(clinical_ids)]
+        d["_d"] = pd.to_datetime(d["day_0_due"], errors="coerce")
+        d = d.dropna(subset=["_d"])
+        for rid, due_date in d.groupby("_rid")["_d"].min().items():
+            if today <= due_date <= end_window:
+                _add(rid, "Day 0", due_date, due_date)
+
+    # Follow-up visits (effective due dates)
+    eff, orig, honored = schedule["eff_due"], schedule["orig_due"], schedule["honored"]
+    for w in MED_FOLLOWUP_WINDOWS:
+        mask = (
+            eff[w].notna() & (eff[w] >= today) & (eff[w] <= end_window) & ~honored[w]
+        )
+        for rid in eff.index[mask.values]:
+            _add(rid, w, eff.at[rid, w], orig.at[rid, w])
+
+    if not rows:
+        return pd.DataFrame(columns=out_cols)
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["Days Left", "Record ID"])
+        .reset_index(drop=True)
+    )
+
+
+def get_overdue_visits(schedule):
+    """Follow-up visits past their EFFECTIVE due date that were not attended.
+
+    A visit is not overdue if it was attended (even late), or if a later visit
+    was attended (participant is back in care, just behind schedule). A visit
+    that follows a late attendance is not due until its rebased date.
+    """
+    today = pd.Timestamp.now().normalize()
+    out_cols = ["Record ID", "Participant ID", "Visit", "Due Date",
+                "Original Due Date", "Days Overdue"]
+    eff, orig = schedule["eff_due"], schedule["orig_due"]
+    honored, later = schedule["honored"], schedule["later_honored"]
+    study_ids = schedule["study_ids"]
+
+    rows = []
+    for w in MED_FOLLOWUP_WINDOWS:
+        mask = eff[w].notna() & (eff[w] < today) & ~honored[w] & ~later[w]
+        for rid in eff.index[mask.values]:
+            due = eff.at[rid, w]
+            rows.append({
+                "Record ID": rid,
+                "Participant ID": study_ids.get(rid, "N/A"),
+                "Visit": w,
+                "Due Date": due.strftime("%Y-%m-%d"),
+                "Original Due Date": orig.at[rid, w].strftime("%Y-%m-%d"),
+                "Days Overdue": (today - due).days,
+            })
+    if not rows:
+        return pd.DataFrame(columns=out_cols)
+    return (
+        pd.DataFrame(rows)
+        .sort_values("Days Overdue", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def get_behind_schedule_active(schedule, overdue):
+    """Participants who attended at least one visit late but have nothing
+    overdue now: active, running behind their original schedule."""
+    cols = ["Record ID", "Participant ID", "Visits attended late",
+            "Last visit attended", "Next visit", "Expected by"]
+    late, honored = schedule["late"], schedule["honored"]
+    hdate, eff = schedule["honored_date"], schedule["eff_due"]
+    study_ids = schedule["study_ids"]
+    overdue_ids = (
+        set(overdue["Record ID"].astype(str)) if not overdue.empty else set()
+    )
+
+    rows = []
+    for rid in late.index[late.any(axis=1).values]:
+        if rid in overdue_ids:
+            continue
+        pending = [w for w in MED_FOLLOWUP_WINDOWS if not honored.at[rid, w]]
+        nxt = pending[0] if pending else None
+        last = hdate.loc[rid].max()
+        rows.append({
+            "Record ID": rid,
+            "Participant ID": study_ids.get(rid, "N/A"),
+            "Visits attended late": int(late.loc[rid].sum()),
+            "Last visit attended": last.strftime("%Y-%m-%d") if pd.notna(last) else "",
+            "Next visit": nxt or "None pending",
+            "Expected by": (
+                eff.at[rid, nxt].strftime("%Y-%m-%d")
+                if nxt and pd.notna(eff.at[rid, nxt]) else ""
+            ),
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _started_medication_rows(df_visits):
+    """Day 0 visit-log rows that carry a date (= medication started).
+
+    Returns (dated_rows_df, id_col, date_field_used, warning).
+    """
+    if df_visits.empty or "visit_window" not in df_visits.columns:
+        return None, None, None, "No visit log data available to count medication starts."
+
+    field = _detect_visit_date_field(df_visits)
     if field is None:
         return None, None, None, (
             "Could not find the visit date field on the visit log. Set "
@@ -1426,43 +1563,17 @@ def build_medication_retention(df_all, df_visits):
     if len(started_ids) == 0:
         return empty, empty_weekly, empty_nr, "No participants have started medication yet."
 
-    # Honored matrix (participant x week)
-    v = df_visits.copy()
-    v[id_col] = v[id_col].astype(str).str.strip()
-    v["_label"] = v["visit_window"].astype(str).str.strip().map(VISIT_WINDOW_CODE_MAP)
-    v = v[v["_label"].isin(MED_FOLLOWUP_WINDOWS)]
-    if "visit_status" in v.columns:
-        status = v["visit_status"].astype(str).str.strip()
-    else:
-        status = pd.Series("", index=v.index)
-    has_date = pd.to_datetime(v[field], errors="coerce").notna()
-    v["_honored"] = (status == "1") | (has_date & ~status.isin(["2", "3", "4"]))
-    if v.empty:
-        honored = pd.DataFrame(False, index=started_ids, columns=MED_FOLLOWUP_WINDOWS)
-    else:
-        honored = (
-            v.groupby([id_col, "_label"])["_honored"].any().unstack()
-            .reindex(index=started_ids, columns=MED_FOLLOWUP_WINDOWS)
-            .fillna(False).astype(bool)
-        )
-
-    # Due dates (participant x week)
+    # Honored matrix and due dates (participant x week). Due dates are the
+    # EFFECTIVE (rebased) ones, so a participant who is running behind but
+    # attending in sequence is not counted as having missed the next visit.
     all_id = "record_id" if "record_id" in df_all.columns else df_all.columns[0]
     today = pd.Timestamp.now().normalize()
-    due = pd.DataFrame(index=started_ids, columns=MED_FOLLOWUP_WINDOWS, dtype="datetime64[ns]")
-    due_fields_found = False
-    for w in MED_FOLLOWUP_WINDOWS:
-        col = MED_DUE_FIELDS[w]
-        s = pd.Series(pd.NaT, index=started_ids, dtype="datetime64[ns]")
-        if col in df_all.columns:
-            t = df_all[[all_id, col]].copy()
-            t[all_id] = t[all_id].astype(str).str.strip()
-            t[col] = pd.to_datetime(t[col], errors="coerce")
-            t = t.dropna(subset=[col])
-            if not t.empty:
-                due_fields_found = True
-                s = t.groupby(all_id)[col].min().reindex(started_ids)
-        due[w] = s.fillna(day0 + pd.Timedelta(days=MED_DUE_FALLBACK_DAYS[w]))
+    sched = build_visit_schedule(
+        df_all, df_visits, ids=started_ids, day0=day0, fallback_from_day0=True
+    )
+    honored = sched["honored"]
+    due = sched["eff_due"]
+    due_fields_found = sched["due_fields_found"]
 
     # Today's appointments are not "due" (i.e. cannot be missed) until the day
     # is over; they only count today if the participant has already attended.
@@ -1858,9 +1969,14 @@ def main():
     # ── Compute metrics ──
     enrollment = process_enrollment(df_prescreen, df_clinical)
     visit_matrix = build_visit_matrix(df_visits)
-    upcoming = get_upcoming_visits(df_clinical, days_ahead=7, df_all=df_all)
+    clinical_ids = (
+        df_clinical["record_id" if "record_id" in df_clinical.columns else df_clinical.columns[0]]
+        if not df_clinical.empty else []
+    )
+    visit_schedule = build_visit_schedule(df_all, df_visits, ids=clinical_ids)
+    upcoming = get_upcoming_visits(df_clinical, df_all, visit_schedule, days_ahead=7)
     day0_due_missing = "day_0_due" not in df_all.columns
-    overdue = get_overdue_visits(df_clinical, df_visits)
+    overdue = get_overdue_visits(visit_schedule)
     safety = get_safety_screening_summary(df_clinical)
     strata_summary = build_stratification_summary(df_clinical)
 
@@ -1920,6 +2036,9 @@ def main():
     )
     overdue = exclude_records(overdue, excluded_ids)
     upcoming = exclude_records(upcoming, excluded_ids)
+    behind_active = exclude_records(
+        get_behind_schedule_active(visit_schedule, overdue), excluded_ids
+    )
 
     # ═══════════════════════════════════════════════════════════
     # VIEW: DASHBOARD
@@ -2399,6 +2518,13 @@ def main():
             st.caption(
                 "No week_#_due dates were found, so due dates are Day 0 + 7/14/21/84/252 days."
             )
+        st.caption(
+            "Catch-up rule: if a participant attends a visit late, the next "
+            "Week 1/2/3 visit is expected one nominal gap (7 days) after that "
+            "attendance rather than on the original Day 0 date, and a missed "
+            "visit is not counted once a later visit has been attended. "
+            "Overdue, Upcoming and Retention all use these rebased dates."
+        )
         if psf_retention.get("not_started"):
             st.caption(
                 f"{psf_retention['not_started']} of {psf_retention['randomised']} participants "
@@ -2444,6 +2570,20 @@ def main():
                 st.info("No visits scheduled in the next 7 days.")
             if day0_due_missing:
                 st.caption("The 'day_0_due' field was not returned by REDCap, so Day 0 visits cannot be listed.")
+
+        with st.expander(
+            f"{len(behind_active)} participant(s) behind schedule but active (caught up)"
+        ):
+            st.caption(
+                "Attended at least one visit late and are attending in sequence, so "
+                "they are not overdue. Their next visit is expected one visit-gap "
+                "after their last attendance (Week 12 and Week 36 stay anchored "
+                "to Day 0)."
+            )
+            if behind_active.empty:
+                st.info("No participants are currently running behind schedule.")
+            else:
+                st.dataframe(behind_active, use_container_width=True, hide_index=True)
 
         st.caption(
             "Terminated and Missed Day 0 participants are excluded from the "
@@ -2711,30 +2851,12 @@ def main():
             unsafe_allow_html=True,
         )
 
-        tab1, tab2, tab3, tab4 = st.tabs(
+        tab3, tab4 = st.tabs(
             [
-                "Overdue Visits",
-                "Upcoming Visits",
                 "Adverse Events",
                 "Terminated / Missed Day 0",
             ]
         )
-
-        with tab1:
-            st.subheader(f"Overdue Visits ({len(overdue)})")
-            if not overdue.empty:
-                st.dataframe(overdue, use_container_width=True, hide_index=True)
-            else:
-                st.success("All visits are on track!")
-
-        with tab2:
-            st.subheader(f"Upcoming Visits - Next 7 Days ({len(upcoming)})")
-            if not upcoming.empty:
-                st.dataframe(upcoming, use_container_width=True, hide_index=True)
-            else:
-                st.info("No visits due in the next 7 days.")
-            if day0_due_missing:
-                st.caption("The 'day_0_due' field was not returned by REDCap, so Day 0 visits cannot be listed.")
 
         with tab3:
             st.subheader(f"Adverse Events ({total_ae})")
