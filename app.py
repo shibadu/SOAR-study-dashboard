@@ -2568,8 +2568,8 @@ def main():
                 st.dataframe(upcoming, use_container_width=True, hide_index=True)
             else:
                 st.info("No visits scheduled in the next 7 days.")
-            if day0_due_missing:
-                st.caption("The 'day_0_due' field was not returned by REDCap, so Day 0 visits cannot be listed.")
+#            if day0_due_missing:
+#                st.caption("The 'day_0_due' field was not returned by REDCap, so Day 0 visits cannot be listed.")
 
         with st.expander(
             f"{len(behind_active)} participant(s) behind schedule but active (caught up)"
